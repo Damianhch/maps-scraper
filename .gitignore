@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Excel output files
+*.xlsx
+
+# Logs
+*.log
+
+# Environment variables
+.env
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
