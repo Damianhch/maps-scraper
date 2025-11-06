@@ -1,5 +1,7 @@
 const puppeteer = require('puppeteer');
 const xlsx = require('xlsx'); // Import the xlsx library to handle Excel files
+const fs = require('fs'); // Import fs to read the industries file
+const path = require('path'); // Import path for file operations
 
 // Function to check if a website is a real business website (not platform/social media)
 function isRealBusinessWebsite(url, businessName) {
@@ -95,9 +97,29 @@ function cleanWebsiteUrl(url, businessName) {
   return '';
 }
 
-async function scrapeGoogleMaps() {
-  // Expanded search area to cover more of Trondheim and surrounding areas
-  const url = 'https://www.google.com/maps/search/restaurants/@63.4250829,10.4155537,12z'; // Reduced zoom level to cover larger area
+// Function to read industries from the text file
+function readIndustriesFromFile() {
+  try {
+    const filePath = path.join(__dirname, 'list of industries.txt');
+    const fileContent = fs.readFileSync(filePath, 'utf-8');
+    const industries = fileContent
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0); // Remove empty lines
+    return industries;
+  } catch (error) {
+    console.error('Error reading industries file:', error.message);
+    // Fallback to default if file can't be read
+    return ['restaurant'];
+  }
+}
+
+async function scrapeGoogleMaps(industry) {
+  const industryStartTime = Date.now(); // Track start time for this industry
+  
+  // Create URL with the specified industry
+  const industryEncoded = encodeURIComponent(industry);
+  const url = `https://www.google.com/maps/search/${industryEncoded}/@63.4250829,10.4155537,12z`; // Reduced zoom level to cover larger area
 
   console.log('Launching browser...');
   const browser = await puppeteer.launch({ 
@@ -187,7 +209,7 @@ async function scrapeGoogleMaps() {
   }
 
   console.log('Scrolling to load more results using "Page Down"...');
-  const maxPageDowns = 5; // Increased to get 200+ results
+  const maxPageDowns = 4; // Increased to get 200+ results
   const scrollDelay = 200; // Delay between each Page Down key press
   let pageDownAttempts = 0;
 
@@ -751,6 +773,7 @@ async function scrapeGoogleMaps() {
         Website: cleanedWebsite || '', // Use cleaned website (empty for non-business links)
         Phone: phone || '',
         Email: email || '',
+        'Contact Person': 'Not found', // Will be filled by expand.js
         Rating: rating || '',
         Hours: hours || '',
         PriceLevel: priceLevel || ''
@@ -773,17 +796,178 @@ async function scrapeGoogleMaps() {
   console.log('Scraping completed. Closing browser...');
   await browser.close();  // Close the Puppeteer browser
 
+  const industryEndTime = Date.now(); // Track end time for this industry
+  const industryDuration = ((industryEndTime - industryStartTime) / 1000).toFixed(2); // Duration in seconds
+
   // Summary of results
   console.log('\n=== FILTERING SUMMARY ===');
+  console.log(`Industry: ${industry}`);
   console.log(`Total businesses found: ${results.length}`);
   console.log(`Businesses KEPT (no real website): ${excelData.length}`);
   console.log(`Businesses FILTERED OUT (have real website): ${results.length - excelData.length}`);
+  console.log(`Time taken: ${industryDuration} seconds`);
   console.log('========================\n');
 
-  // Create and write the Excel file
+  // Return the collected data along with timing info
+  return {
+    data: excelData,
+    timing: {
+      industry: industry,
+      startTime: new Date(industryStartTime).toISOString(),
+      endTime: new Date(industryEndTime).toISOString(),
+      durationSeconds: parseFloat(industryDuration),
+      totalBusinessesFound: results.length,
+      businessesKept: excelData.length,
+      businessesFiltered: results.length - excelData.length
+    }
+  };
+}
+
+// Main function to process all industries
+async function processAllIndustries() {
+  const overallStartTime = Date.now(); // Track overall start time
+  const industries = readIndustriesFromFile();
+  console.log(`Found ${industries.length} industries to process: ${industries.join(', ')}`);
+  console.log(`Overall start time: ${new Date(overallStartTime).toISOString()}\n`);
+  
+  // Array to hold all results from all industries
+  const allResults = [];
+  // Array to hold timing data for analysis
+  const timingData = [];
+  
+  // Process each industry sequentially
+  for (const [index, industry] of industries.entries()) {
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Processing industry ${index + 1}/${industries.length}: ${industry}`);
+    console.log(`${'='.repeat(60)}\n`);
+    
+    try {
+      const industryResult = await scrapeGoogleMaps(industry);
+      
+      // Add industry information to each result
+      const resultsWithIndustry = industryResult.data.map(result => ({
+        ...result,
+        Industry: industry // Add industry column to track which industry each business belongs to
+      }));
+      
+      allResults.push(...resultsWithIndustry);
+      
+      // Store timing data
+      timingData.push(industryResult.timing);
+      
+      console.log(`\n✅ Completed industry "${industry}": ${industryResult.data.length} businesses collected in ${industryResult.timing.durationSeconds} seconds`);
+      
+      // Add a delay between industries to avoid rate limiting (except for the last one)
+      if (index < industries.length - 1) {
+        const delay = 3000; // 3 second delay between industries
+        console.log(`Waiting ${delay}ms before processing next industry...\n`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    } catch (error) {
+      console.error(`❌ Error processing industry "${industry}":`, error.message);
+      console.log('Continuing with next industry...\n');
+      
+      // Add error entry to timing data
+      timingData.push({
+        industry: industry,
+        startTime: 'Error',
+        endTime: 'Error',
+        durationSeconds: 0,
+        totalBusinessesFound: 0,
+        businessesKept: 0,
+        businessesFiltered: 0,
+        error: error.message
+      });
+      // Continue with next industry even if one fails
+    }
+  }
+  
+  const overallEndTime = Date.now(); // Track overall end time
+  const overallDuration = ((overallEndTime - overallStartTime) / 1000).toFixed(2); // Duration in seconds
+  
+  // Create analysis data for the "scraper analyzing" sheet
+  const analysisData = [
+    {
+      Metric: 'Overall Start Time',
+      Value: new Date(overallStartTime).toISOString()
+    },
+    {
+      Metric: 'Overall End Time',
+      Value: new Date(overallEndTime).toISOString()
+    },
+    {
+      Metric: 'Total Duration (seconds)',
+      Value: parseFloat(overallDuration)
+    },
+    {
+      Metric: 'Total Duration (minutes)',
+      Value: (parseFloat(overallDuration) / 60).toFixed(2)
+    },
+    {
+      Metric: 'Total Duration (hours)',
+      Value: (parseFloat(overallDuration) / 3600).toFixed(2)
+    },
+    {
+      Metric: 'Total Industries Processed',
+      Value: industries.length
+    },
+    {
+      Metric: 'Total Businesses Collected',
+      Value: allResults.length
+    },
+    {
+      Metric: 'Average Time per Industry (seconds)',
+      Value: timingData.length > 0 ? (timingData.reduce((sum, t) => sum + (t.durationSeconds || 0), 0) / timingData.length).toFixed(2) : 0
+    },
+    {
+      Metric: 'Average Businesses per Industry',
+      Value: timingData.length > 0 ? (timingData.reduce((sum, t) => sum + (t.businessesKept || 0), 0) / timingData.length).toFixed(2) : 0
+    }
+  ];
+  
+  // Add per-industry breakdown
+  timingData.forEach(timing => {
+    analysisData.push({
+      Metric: `Industry: ${timing.industry}`,
+      Value: ''
+    });
+    analysisData.push({
+      Metric: `  - Duration (seconds)`,
+      Value: timing.durationSeconds || 0
+    });
+    analysisData.push({
+      Metric: `  - Total Businesses Found`,
+      Value: timing.totalBusinessesFound || 0
+    });
+    analysisData.push({
+      Metric: `  - Businesses Kept`,
+      Value: timing.businessesKept || 0
+    });
+    analysisData.push({
+      Metric: `  - Businesses Filtered`,
+      Value: timing.businessesFiltered || 0
+    });
+    if (timing.error) {
+      analysisData.push({
+        Metric: `  - Error`,
+        Value: timing.error
+      });
+    }
+  });
+
+  // Create and write the combined Excel file
+  console.log(`\n${'='.repeat(60)}`);
+  console.log('Creating combined Excel file with all industries...');
+  console.log(`Total duration: ${overallDuration} seconds (${(parseFloat(overallDuration) / 60).toFixed(2)} minutes)`);
+  console.log(`${'='.repeat(60)}\n`);
+  
   const workbook = xlsx.utils.book_new(); // Create a new workbook
-  const worksheet = xlsx.utils.json_to_sheet(excelData); // Convert the data to a worksheet
+  const worksheet = xlsx.utils.json_to_sheet(allResults); // Convert all data to a worksheet
   xlsx.utils.book_append_sheet(workbook, worksheet, 'Results'); // Append the worksheet to the workbook
+  
+  // Create the analysis worksheet
+  const analysisWorksheet = xlsx.utils.json_to_sheet(analysisData);
+  xlsx.utils.book_append_sheet(workbook, analysisWorksheet, 'scraper analyzing'); // Append the analysis worksheet
 
   // Write the Excel file to disk with timestamp to avoid locking issues
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -791,26 +975,30 @@ async function scrapeGoogleMaps() {
   
   try {
     xlsx.writeFile(workbook, filename); 
-    console.log(`Excel file "${filename}" has been created successfully.`);
+    console.log(`✅ Excel file "${filename}" has been created successfully.`);
+    console.log(`Total businesses collected: ${allResults.length}`);
+    console.log(`Analysis data saved to "scraper analyzing" sheet.`);
   } catch (error) {
     if (error.code === 'EBUSY') {
       console.log('File is locked, trying with a different name...');
       const altFilename = `GoogleMapsResults_${Date.now()}.xlsx`;
       xlsx.writeFile(workbook, altFilename);
-      console.log(`Excel file "${altFilename}" has been created successfully.`);
+      console.log(`✅ Excel file "${altFilename}" has been created successfully.`);
+      console.log(`Total businesses collected: ${allResults.length}`);
+      console.log(`Analysis data saved to "scraper analyzing" sheet.`);
     } else {
       throw error;
     }
   }
 }
 
-// Execute the scraping function and handle errors
-console.log('Starting scraper...');
-scrapeGoogleMaps()
+// Execute the main function to process all industries
+console.log('Starting scraper for all industries...');
+processAllIndustries()
   .then(() => {
-    console.log('Scraper completed successfully!');
+    console.log('\n✅ All industries processed successfully!');
   })
   .catch((error) => {
-    console.error('Scraper failed with error:', error);
+    console.error('❌ Scraper failed with error:', error);
     process.exit(1);
   });
