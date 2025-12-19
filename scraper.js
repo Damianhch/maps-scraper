@@ -774,6 +774,7 @@ async function scrapeGoogleMaps(industry) {
         Phone: phone || '',
         Email: email || '',
         'Contact Person': 'Not found', // Will be filled by expand.js
+        'Business Phone': 'Not found', // Will be filled by expand.js from Proff.no
         Rating: rating || '',
         Hours: hours || '',
         PriceLevel: priceLevel || ''
