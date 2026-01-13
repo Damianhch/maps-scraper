@@ -4,10 +4,214 @@ const fs = require('fs'); // Import fs to read the industries file
 const path = require('path'); // Import path for file operations
 const readline = require('readline'); // Import readline for user input
 
+// ============================================
+// PARALLEL BROWSER CONFIGURATION
+// ============================================
+const NUM_PARALLEL_BROWSERS = 1; // Number of browsers to run in parallel (set to 1 for testing)
+
+// ============================================
+// GRACEFUL SHUTDOWN HANDLER
+// ============================================
+// Global state for graceful shutdown - stores all collected data from ALL browsers
+const gracefulShutdown = {
+  isShuttingDown: false,
+  allResults: [],
+  timingData: [],
+  overallStartTime: null,
+  currentIndustries: [], // Track current industry per browser
+  browsers: [], // Track all browser instances
+  industriesProcessed: 0,
+  totalIndustries: 0,
+  browserStatus: [] // Track status of each browser worker
+};
+
+// Function to save data during shutdown
+async function saveDataAndExit(reason = 'User requested shutdown') {
+  if (gracefulShutdown.isShuttingDown) {
+    console.log('\n⏳ Already shutting down, please wait...');
+    return;
+  }
+  
+  gracefulShutdown.isShuttingDown = true;
+  
+  console.log('\n');
+  console.log('='.repeat(60));
+  console.log(`🛑 GRACEFUL SHUTDOWN INITIATED`);
+  console.log(`   Reason: ${reason}`);
+  console.log('='.repeat(60));
+  
+  // SAVE DATA FIRST before closing browser (priority!)
+  // Check if we have any data to save
+  if (gracefulShutdown.allResults.length === 0) {
+    console.log('\n⚠️  No data collected yet - nothing to save.');
+    console.log('   The scraper was stopped before any businesses were processed.');
+    // Close browser after
+    if (gracefulShutdown.currentBrowser) {
+      try { await gracefulShutdown.currentBrowser.close(); } catch (e) {}
+    }
+    process.exit(0);
+    return;
+  }
+  
+  console.log(`\n📊 SAVING ${gracefulShutdown.allResults.length} collected businesses IMMEDIATELY...`);
+  
+  const overallEndTime = Date.now();
+  const overallDuration = gracefulShutdown.overallStartTime 
+    ? ((overallEndTime - gracefulShutdown.overallStartTime) / 1000).toFixed(2) 
+    : 0;
+  
+  // Create analysis data
+  const analysisData = [
+    { Metric: 'Shutdown Reason', Value: reason },
+    { Metric: 'Overall Start Time', Value: gracefulShutdown.overallStartTime ? new Date(gracefulShutdown.overallStartTime).toISOString() : 'N/A' },
+    { Metric: 'Shutdown Time', Value: new Date(overallEndTime).toISOString() },
+    { Metric: 'Total Duration (seconds)', Value: parseFloat(overallDuration) },
+    { Metric: 'Total Duration (minutes)', Value: (parseFloat(overallDuration) / 60).toFixed(2) },
+    { Metric: 'Parallel Browsers', Value: NUM_PARALLEL_BROWSERS },
+    { Metric: 'Industries Processed', Value: `${gracefulShutdown.industriesProcessed}/${gracefulShutdown.totalIndustries}` },
+    { Metric: 'Total Businesses Collected', Value: gracefulShutdown.allResults.length },
+    { Metric: 'Status', Value: 'PARTIAL - Graceful Shutdown' }
+  ];
+  
+  // Add per-browser status
+  if (gracefulShutdown.browserStatus) {
+    for (let i = 0; i < gracefulShutdown.browserStatus.length; i++) {
+      analysisData.push({ 
+        Metric: `Browser ${i + 1} Status`, 
+        Value: gracefulShutdown.browserStatus[i] || 'unknown' 
+      });
+      if (gracefulShutdown.currentIndustries && gracefulShutdown.currentIndustries[i]) {
+        analysisData.push({ 
+          Metric: `Browser ${i + 1} Current Industry`, 
+          Value: gracefulShutdown.currentIndustries[i] 
+        });
+      }
+    }
+  }
+  
+  // Add per-industry breakdown
+  gracefulShutdown.timingData.forEach(timing => {
+    analysisData.push({ Metric: `Industry: ${timing.industry}`, Value: '' });
+    analysisData.push({ Metric: `  - Duration (seconds)`, Value: timing.durationSeconds || 0 });
+    analysisData.push({ Metric: `  - Businesses Kept`, Value: timing.businessesKept || 0 });
+    if (timing.error) {
+      analysisData.push({ Metric: `  - Error`, Value: timing.error });
+    }
+  });
+  
+  // Deduplicate results before saving
+  const seenBusinesses = new Set();
+  const deduplicatedResults = gracefulShutdown.allResults.filter(business => {
+    const key = `${business.Name}|${business.Address}`.toLowerCase();
+    if (seenBusinesses.has(key)) {
+      return false;
+    }
+    seenBusinesses.add(key);
+    return true;
+  });
+  
+  const duplicatesRemoved = gracefulShutdown.allResults.length - deduplicatedResults.length;
+  if (duplicatesRemoved > 0) {
+    console.log(`   📋 Removed ${duplicatesRemoved} duplicate businesses`);
+  }
+  
+  // Create and write the Excel file - DO THIS SYNCHRONOUSLY FIRST
+  const workbook = xlsx.utils.book_new();
+  const worksheet = xlsx.utils.json_to_sheet(deduplicatedResults);
+  xlsx.utils.book_append_sheet(workbook, worksheet, 'Results');
+  
+  const analysisWorksheet = xlsx.utils.json_to_sheet(analysisData);
+  xlsx.utils.book_append_sheet(workbook, analysisWorksheet, 'scraper analyzing');
+  
+  // Save with PARTIAL prefix so you know it's from a shutdown
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filename = `PARTIAL_GoogleMapsResults_${timestamp}.xlsx`;
+  
+  let saved = false;
+  try {
+    xlsx.writeFile(workbook, filename);
+    console.log(`\n✅ SUCCESS! Data saved to: ${filename}`);
+    console.log(`   📁 Total businesses saved: ${deduplicatedResults.length}`);
+    console.log(`   📁 Industries completed: ${gracefulShutdown.industriesProcessed}/${gracefulShutdown.totalIndustries}`);
+    console.log(`   ⏱️  Total time: ${overallDuration} seconds`);
+    saved = true;
+  } catch (error) {
+    console.log(`   ⚠️  Excel save failed: ${error.message}, trying alternative...`);
+    // Try alternative filename if locked
+    const altFilename = `PARTIAL_GoogleMapsResults_${Date.now()}.xlsx`;
+    try {
+      xlsx.writeFile(workbook, altFilename);
+      console.log(`\n✅ SUCCESS! Data saved to: ${altFilename}`);
+      console.log(`   📁 Total businesses saved: ${gracefulShutdown.allResults.length}`);
+      saved = true;
+    } catch (e) {
+      console.log(`   ⚠️  Alternative Excel save failed: ${e.message}`);
+    }
+  }
+  
+  // If Excel failed, try JSON as last resort
+  if (!saved) {
+    try {
+      const jsonFilename = `PARTIAL_GoogleMapsResults_${Date.now()}.json`;
+      fs.writeFileSync(jsonFilename, JSON.stringify(gracefulShutdown.allResults, null, 2));
+      console.log(`\n✅ Data saved as JSON: ${jsonFilename}`);
+      console.log(`   📁 Total businesses saved: ${gracefulShutdown.allResults.length}`);
+    } catch (jsonError) {
+      console.log(`\n❌ CRITICAL: Could not save data: ${jsonError.message}`);
+    }
+  }
+  
+  // NOW close ALL browsers (after data is saved)
+  if (gracefulShutdown.browsers && gracefulShutdown.browsers.length > 0) {
+    console.log(`🌐 Closing ${gracefulShutdown.browsers.length} browser(s)...`);
+    for (const browser of gracefulShutdown.browsers) {
+      try {
+        if (browser) await browser.close();
+      } catch (e) {
+        // Ignore browser close errors - data is already saved
+      }
+    }
+  }
+  
+  console.log('\n👋 Scraper shutdown complete. Your data is safe!');
+  console.log('='.repeat(60));
+  process.exit(0);
+}
+
+// Register shutdown handlers for Ctrl+C and other signals
+// Use synchronous approach to ensure data is saved before exit
+process.on('SIGINT', async () => {
+  await saveDataAndExit('Ctrl+C pressed');
+});
+process.on('SIGTERM', async () => {
+  await saveDataAndExit('Process terminated');
+});
+process.on('SIGHUP', async () => {
+  await saveDataAndExit('Terminal closed');
+});
+
+// Handle uncaught exceptions - save data before crashing
+process.on('uncaughtException', async (error) => {
+  console.error('\n❌ UNCAUGHT EXCEPTION:', error.message);
+  await saveDataAndExit(`Uncaught exception: ${error.message}`);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('\n❌ UNHANDLED REJECTION:', reason);
+  await saveDataAndExit(`Unhandled rejection: ${reason}`);
+});
+
+console.log('✅ Graceful shutdown handler installed - Press Ctrl+C at any time to save data and exit\n');
+
+// ============================================
+// END GRACEFUL SHUTDOWN HANDLER
+// ============================================
+
 // TESTING MODE: Set to number of businesses to process, or null/undefined to process all
 // Example: const TEST_LIMIT = 10;  // Process only first 10 businesses
 //          const TEST_LIMIT = null; // Process all businesses
-const TEST_LIMIT = 20; // Set to a number (e.g., 10) to limit processing, or null to process all
+const TEST_LIMIT = 5; // Set to a number (e.g., 10) to limit processing, or null to process all
 
 // PROXY CONFIGURATION
 // Option 1: Use proxy list file (proxies.txt - one proxy per line, format: ip:port or ip:port:user:pass)
@@ -19,17 +223,89 @@ const PROXY_ROTATION_INTERVAL = 50; // Rotate proxy every N businesses
 const SESSION_ROTATION_INTERVAL = 100; // Create new browser session every N businesses
 
 // DELAY CONFIGURATION (in milliseconds)
-// Balanced delays - fast enough but still safe
+// Slower delays to avoid triggering Google's anti-bot detection
 const MIN_DELAY_BETWEEN_REQUESTS = 2000; // Minimum delay between requests (2 seconds)
 const MAX_DELAY_BETWEEN_REQUESTS = 5000; // Maximum delay between requests (5 seconds)
-const MIN_DELAY_BETWEEN_SCROLLS = 3000; // Minimum delay between scrolls (3 seconds)
-const MAX_DELAY_BETWEEN_SCROLLS = 6000; // Maximum delay between scrolls (6 seconds)
-const MIN_DELAY_BETWEEN_INDUSTRIES = 3000; // Minimum delay between industries (3 seconds)
-const MAX_DELAY_BETWEEN_INDUSTRIES = 3000; // Maximum delay between industries (3 seconds)
+const MIN_DELAY_BETWEEN_SCROLLS = 5000; // Minimum delay between scrolls (5 seconds) - increased from 3
+const MAX_DELAY_BETWEEN_SCROLLS = 8000; // Maximum delay between scrolls (8 seconds) - increased from 6
+const MIN_DELAY_BETWEEN_INDUSTRIES = 5000; // Minimum delay between industries (5 seconds)
+const MAX_DELAY_BETWEEN_INDUSTRIES = 8000; // Maximum delay between industries (8 seconds)
 
 // Helper function to get random delay
 function getRandomDelay(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Helper function to detect CAPTCHA pages
+async function detectCaptcha(page) {
+  try {
+    const captchaInfo = await page.evaluate(() => {
+      const bodyText = (document.body.innerText || '').toLowerCase();
+      const bodyHtml = (document.body.innerHTML || '').toLowerCase();
+      const url = window.location.href.toLowerCase();
+      
+      // Check for CAPTCHA-specific indicators (not just blocking text)
+      const captchaIndicators = {
+        // Google reCAPTCHA iframe or widget
+        hasRecaptcha: document.querySelector('iframe[src*="recaptcha"]') !== null ||
+                      document.querySelector('.g-recaptcha') !== null ||
+                      document.querySelector('#recaptcha') !== null,
+        
+        // "I'm not a robot" checkbox (specific CAPTCHA text)
+        hasNotRobot: bodyText.includes("i'm not a robot") ||
+                     bodyText.includes('jeg er ikke en robot'), // Norwegian
+        
+        // Google sorry page with CAPTCHA (URL-based, more reliable)
+        hasSorryPage: url.includes('/sorry/') || url.includes('sorry.google'),
+        
+        // Challenge iframe
+        hasChallenge: document.querySelector('iframe[src*="challenge"]') !== null
+      };
+      
+      // CAPTCHA requires at least one of these specific indicators
+      const isCaptcha = captchaIndicators.hasRecaptcha || 
+                        captchaIndicators.hasNotRobot || 
+                        captchaIndicators.hasSorryPage ||
+                        captchaIndicators.hasChallenge;
+      
+      return {
+        isCaptcha: isCaptcha,
+        indicators: captchaIndicators,
+        url: window.location.href,
+        title: document.title
+      };
+    });
+    
+    return captchaInfo;
+  } catch (error) {
+    return { isCaptcha: false, error: error.message };
+  }
+}
+
+// Helper function to handle CAPTCHA detection
+async function handleCaptchaDetection(page, context = {}) {
+  const captchaInfo = await detectCaptcha(page);
+  
+  if (captchaInfo.isCaptcha) {
+    console.log('\n' + '!'.repeat(60));
+    console.log('🤖 CAPTCHA DETECTED!');
+    console.log('!'.repeat(60));
+    console.log('Google is asking for human verification.');
+    console.log('Detected indicators:', Object.entries(captchaInfo.indicators)
+      .filter(([k, v]) => v === true)
+      .map(([k]) => k)
+      .join(', '));
+    
+    // Save debug info
+    await saveDebugInfo(page, 'captcha_detected', {
+      ...context,
+      captchaInfo: captchaInfo
+    });
+    
+    return true; // CAPTCHA was detected
+  }
+  
+  return false; // No CAPTCHA
 }
 
 // Helper function to save debugging information
@@ -611,13 +887,30 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
     // Browser exists, just navigate to new industry URL (keep browser open)
     console.log(`🔄 Browser already open, navigating to new industry: ${industry}...`);
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    await handleConsent(page, url); // Handle consent if needed
     await new Promise(resolve => setTimeout(resolve, 3000)); // Wait for page to load
+    
+    // Check if we landed on consent page and handle it
+    const currentUrl = page.url();
+    if (currentUrl.includes('consent')) {
+      console.log('  Consent page detected, handling...');
+      await handleConsent(page, url);
+    }
   }
   
   // Wait for page to be fully loaded and results to be visible
   console.log('⏳ Waiting for results to load...');
-  await new Promise(resolve => setTimeout(resolve, 3000));
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  // Check for CAPTCHA before proceeding
+  const captchaDetected = await handleCaptchaDetection(page, { 
+    industry: industry, 
+    stage: 'after_navigation' 
+  });
+  
+  if (captchaDetected) {
+    console.log('🛑 Cannot proceed - CAPTCHA blocking access');
+    throw new Error('CAPTCHA detected - Google requires human verification');
+  }
   
   // Verify results are visible
   const hasResults = await page.evaluate(() => {
@@ -653,7 +946,7 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
 
   console.log('Scrolling to load more results...');
   // In test mode, reduce scroll attempts to 4 for faster testing
-  const maxPageDowns = TEST_LIMIT ? 4 : 40; // Test mode: 4 scrolls, Normal: 40 scrolls for 200+ results
+  const maxPageDowns = TEST_LIMIT ? 3 : 100; // Test mode: 3 scrolls, Normal: 100 scrolls for more results
   let pageDownAttempts = 0;
 
   // Collect all business URLs during scrolling
@@ -706,38 +999,83 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
       if (panelInfo.found) {
         console.log(`  ✅ Found panel: ${panelInfo.selector} at (${Math.round(panelInfo.x)}, ${Math.round(panelInfo.y)})`);
         
-        // Move mouse to center of panel
-        await page.mouse.move(panelInfo.x, panelInfo.y);
-        await new Promise(resolve => setTimeout(resolve, 200));
+        // Move mouse to center of panel with slight randomization
+        const offsetX = (Math.random() - 0.5) * 50; // Random offset ±25px
+        const offsetY = (Math.random() - 0.5) * 50;
+        await page.mouse.move(panelInfo.x + offsetX, panelInfo.y + offsetY, { steps: 10 });
+        await new Promise(resolve => setTimeout(resolve, 300 + Math.random() * 200));
         
-        // Scroll down using mouse wheel (reduced to avoid triggering too many reloads)
-        const scrollAmount = 3; // Number of wheel scrolls (reduced from 5 to avoid suspicion)
+        // Scroll down using mouse wheel - slower and more human-like
+        const scrollAmount = 3; // 3 scrolls per attempt
         for (let i = 0; i < scrollAmount; i++) {
-          await page.mouse.wheel({ deltaY: 500 }); // Scroll down
-          await new Promise(resolve => setTimeout(resolve, 150)); // Slightly longer delay between scrolls
+          await page.mouse.wheel({ deltaY: 400 + Math.random() * 200 }); // Random scroll 400-600
+          await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 300)); // 400-700ms between scrolls
         }
         
         console.log(`  📜 Scrolled ${scrollAmount} times with mouse wheel`);
       } else {
         console.log('  ⚠️  Panel not found, using window scroll...');
         // Fallback: scroll window using mouse
-        await page.mouse.move(640, 360); // Center of 1280x720 window
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await page.mouse.move(640 + (Math.random() - 0.5) * 100, 360 + (Math.random() - 0.5) * 100);
+        await new Promise(resolve => setTimeout(resolve, 300));
         
         for (let i = 0; i < 3; i++) {
-          await page.mouse.wheel({ deltaY: 500 });
-          await new Promise(resolve => setTimeout(resolve, 150));
+          await page.mouse.wheel({ deltaY: 400 + Math.random() * 200 });
+          await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 300));
         }
       }
       
-      // Also use keyboard scrolling as additional method
+      // Also use keyboard scrolling as additional method (just once, not twice)
       await page.keyboard.press('PageDown');
-      await new Promise(resolve => setTimeout(resolve, 300));
-      await page.keyboard.press('PageDown');
-      await new Promise(resolve => setTimeout(resolve, 300));
+      await new Promise(resolve => setTimeout(resolve, 500));
       
-      // Wait for content to load (shorter wait)
-      const loadDelay = getRandomDelay(1500, 2500);
+      // SMART WAIT: Wait for new content to load before continuing
+      // This prevents scrolling too fast and triggering Google's anti-bot
+      console.log('  ⏳ Waiting for new results to load...');
+      const previousCount = allBusinessUrls.size;
+      let waitAttempts = 0;
+      const maxWaitAttempts = 6; // Wait up to 6 attempts (about 12 seconds max)
+      
+      while (waitAttempts < maxWaitAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+        
+        // Check if new results appeared
+        const currentCount = await page.evaluate(() => {
+          return document.querySelectorAll('a[href*="/maps/place/"]').length;
+        }).catch(() => 0);
+        
+        // Also check for loading indicator
+        const isLoading = await page.evaluate(() => {
+          // Check for various loading indicators
+          const loadingSelectors = [
+            '[data-loading="true"]',
+            '.loading',
+            '[aria-busy="true"]',
+            '.m6QErb [role="progressbar"]',
+            'div[role="main"] [role="progressbar"]'
+          ];
+          return loadingSelectors.some(sel => document.querySelector(sel) !== null);
+        }).catch(() => false);
+        
+        if (isLoading) {
+          console.log('    ⏳ Still loading...');
+          waitAttempts++;
+          continue;
+        }
+        
+        if (currentCount > previousCount) {
+          console.log(`    ✅ New results detected (${currentCount} vs ${previousCount})`);
+          break;
+        }
+        
+        waitAttempts++;
+        if (waitAttempts >= maxWaitAttempts) {
+          console.log('    ⏱️  Max wait time reached, continuing...');
+        }
+      }
+      
+      // Additional safety delay
+      const loadDelay = getRandomDelay(1000, 2000);
       await new Promise(resolve => setTimeout(resolve, loadDelay));
       
       // Collect business URLs from current page state
@@ -783,20 +1121,89 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
           noNewResultsCount++;
           console.log(`  No new results this scroll (${noNewResultsCount}/3)`);
           
-          // If we haven't gotten new results for 3 consecutive scrolls, stop trying
+          // If we haven't gotten new results for 3 consecutive scrolls, try refreshing
           if (noNewResultsCount >= 3) {
-            console.log('  ⚠️  No new results for 3 attempts, stopping early...');
+            console.log('  ⚠️  No new results for 3 attempts, trying page refresh...');
             
-            // Save debug info before stopping (could be Google blocking or end of results)
+            // Check if CAPTCHA appeared first
+            const scrollCaptcha = await handleCaptchaDetection(page, {
+              industry: industry,
+              stage: 'during_scroll',
+              scrollAttempt: pageDownAttempts,
+              urlsFound: allBusinessUrls.size
+            });
+            
+            if (scrollCaptcha) {
+              console.log('  🤖 CAPTCHA is blocking further results!');
+              throw new Error('CAPTCHA detected during scrolling - Google requires human verification');
+            }
+            
+            // Try refreshing the page to get more results
+            console.log('  🔄 Refreshing page to try loading more results...');
+            const urlsBeforeRefresh = allBusinessUrls.size;
+            
+            try {
+              // Navigate back to the search URL to refresh results
+              const industryEncoded = encodeURIComponent(industry);
+              const refreshUrl = `https://www.google.com/maps/search/${industryEncoded}/@63.4250829,10.4155537,12z?hl=no&gl=no`;
+              await page.goto(refreshUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+              await new Promise(resolve => setTimeout(resolve, 4000)); // Wait for results to load
+              
+              // Scroll down a bit to trigger loading
+              for (let refreshScroll = 0; refreshScroll < 5; refreshScroll++) {
+                await page.keyboard.press('PageDown');
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                // Collect URLs after each scroll
+                const refreshUrls = await page.evaluate(() => {
+                  const urls = [];
+                  document.querySelectorAll('a[href*="/maps/place/"]').forEach(link => {
+                    const href = link.getAttribute('href');
+                    if (href) {
+                      const fullUrl = href.startsWith('http') ? href : `https://www.google.com${href}`;
+                      if (!urls.includes(fullUrl)) urls.push(fullUrl);
+                    }
+                  });
+                  return urls;
+                });
+                
+                // Add any new URLs found after refresh
+                const newRefreshUrls = refreshUrls.filter(url => !allBusinessUrls.has(url));
+                newRefreshUrls.forEach(url => allBusinessUrls.add(url));
+                
+                if (newRefreshUrls.length > 0) {
+                  console.log(`  🔄 Refresh scroll ${refreshScroll + 1}: Found ${newRefreshUrls.length} NEW results!`);
+                }
+              }
+              
+              const urlsAfterRefresh = allBusinessUrls.size;
+              const newFromRefresh = urlsAfterRefresh - urlsBeforeRefresh;
+              
+              if (newFromRefresh > 0) {
+                console.log(`  ✅ Refresh found ${newFromRefresh} new results! Continuing to scroll...`);
+                noNewResultsCount = 0; // Reset counter since we got new results
+                // Continue the while loop to keep scrolling
+                continue;
+              } else {
+                console.log('  ⚠️  Refresh did not find new results. Moving to analysis...');
+              }
+              
+            } catch (refreshError) {
+              console.log(`  ⚠️  Refresh failed: ${refreshError.message}`);
+            }
+            
+            // If we still have no new results after refresh, save debug and exit
             console.log('  📸 Taking screenshot and saving debug info...');
             await saveDebugInfo(page, 'no_more_results', {
               industry: industry,
               scrollAttempt: pageDownAttempts,
               totalUrlsFound: allBusinessUrls.size,
-              lastUrlCount: previousUrlCount
+              lastUrlCount: previousUrlCount,
+              triedRefresh: true,
+              captchaDetected: false
             });
             
-            break; // Exit the while loop early
+            break; // Exit the while loop - truly no more results
           }
           
           // If we haven't gotten new results for 2 consecutive scrolls, try scrolling more aggressively
@@ -1375,6 +1782,19 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
         console.log('Could not extract additional details:', error.message);
       }
 
+      // Check for CAPTCHA during business scraping
+      const businessCaptcha = await handleCaptchaDetection(page, {
+        industry: industry,
+        businessIndex: index + 1,
+        businessName: businessName,
+        stage: 'business_scraping'
+      });
+      
+      if (businessCaptcha) {
+        console.log('  🤖 CAPTCHA detected while scraping business!');
+        throw new Error('CAPTCHA detected during business scraping - Google requires human verification');
+      }
+
       // Check for Google blocking during scraping
       const isBlocked = await page.evaluate(() => {
         const bodyText = document.body.innerText || '';
@@ -1429,7 +1849,7 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
       console.log(`Email: ${email}`);
 
       // Add the collected data to the excelData array
-      excelData.push({
+      const businessData = {
         Name: businessName,
         Address: address || '',
         Website: cleanedWebsite || '', // Use cleaned website (empty for non-business links)
@@ -1439,8 +1859,20 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
         'Business Phone': 'Not found', // Will be filled by expand.js from Proff.no
         Rating: rating || '',
         Hours: hours || '',
-        PriceLevel: priceLevel || ''
-      });
+        PriceLevel: priceLevel || '',
+        Industry: industry // Add industry tag for real-time sync
+      };
+      
+      excelData.push(businessData);
+      
+      // *** REAL-TIME SYNC: Update graceful shutdown with this business immediately ***
+      // This ensures even partial industry data is saved on Ctrl+C
+      gracefulShutdown.allResults.push(businessData);
+      
+      // Log progress every 5 businesses
+      if (excelData.length % 5 === 0) {
+        console.log(`💾 [Auto-save] ${gracefulShutdown.allResults.length} total businesses in memory`);
+      }
       
       // Clean up memory after each business
       await page.evaluate(() => {
@@ -1590,327 +2022,352 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
   };
 }
 
-// Main function to process all industries
-async function processAllIndustries() {
-  const overallStartTime = Date.now(); // Track overall start time
-  const industries = readIndustriesFromFile();
+// Worker function to process a subset of industries in one browser
+async function browserWorker(workerId, industries, proxies) {
+  const workerPrefix = `[Browser ${workerId + 1}]`;
+  console.log(`${workerPrefix} 🚀 Starting with ${industries.length} industries: ${industries.join(', ')}`);
   
-  // Load proxies if enabled (empty array if disabled)
-  const proxies = USE_PROXIES ? loadProxies() : [];
-  if (USE_PROXIES && proxies.length === 0) {
-    console.log('⚠️  WARNING: Proxy rotation enabled but no proxies found!');
-    console.log(`   Create a file named "${PROXY_FILE}" with one proxy per line.`);
-    console.log(`   Continuing without proxies...\n`);
-  }
+  // Worker-specific state
+  let browser = null;
+  let page = null;
+  let consecutiveFailedIndustries = 0;
+  const workerResults = [];
+  const workerTimingData = [];
   
-  console.log(`Found ${industries.length} industries to process: ${industries.join(', ')}`);
-  console.log(`Overall start time: ${new Date(overallStartTime).toISOString()}`);
-  if (USE_PROXIES && proxies.length > 0) {
-    console.log(`📡 Proxy rotation: ENABLED (${proxies.length} proxies loaded)`);
-  } else {
-    console.log(`📡 Proxy rotation: DISABLED`);
-  }
-  console.log(`\n`);
+  // Update global browser list
+  gracefulShutdown.browserStatus[workerId] = 'running';
+  gracefulShutdown.currentIndustries[workerId] = null;
   
-  // Array to hold all results from all industries
-  const allResults = [];
-  // Array to hold timing data for analysis
-  const timingData = [];
-  
-  // Shared browser instance for session management
-  let sharedBrowser = null;
-  let sharedPage = null;
-  let businessesProcessed = 0;
-  
-  // Process each industry sequentially
-  for (const [index, industry] of industries.entries()) {
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`Processing industry ${index + 1}/${industries.length}: ${industry}`);
-    console.log(`${'='.repeat(60)}\n`);
-    
-    try {
-      // Rotate session every N businesses across all industries
-      if (businessesProcessed > 0 && businessesProcessed % SESSION_ROTATION_INTERVAL === 0) {
-        console.log(`🔄 Rotating browser session (${businessesProcessed} total businesses processed)...`);
-        if (sharedBrowser) {
-          try {
-            await sharedBrowser.close();
-          } catch (e) {}
-        }
-        sharedBrowser = null;
-        sharedPage = null;
+  try {
+    for (const [index, industry] of industries.entries()) {
+      // Check if shutdown was requested
+      if (gracefulShutdown.isShuttingDown) {
+        console.log(`${workerPrefix} 🛑 Shutdown requested, stopping...`);
+        break;
       }
       
+      // Update current industry for this worker
+      gracefulShutdown.currentIndustries[workerId] = industry;
+      
+      console.log(`\n${workerPrefix} ${'='.repeat(50)}`);
+      console.log(`${workerPrefix} Processing industry ${index + 1}/${industries.length}: ${industry}`);
+      console.log(`${workerPrefix} 💾 Worker data: ${workerResults.length} | Total: ${gracefulShutdown.allResults.length}`);
+      console.log(`${workerPrefix} ${'='.repeat(50)}\n`);
+      
+      try {
       // Retry up to 3 times per industry
       let industryRetries = 0;
-      const maxIndustryRetries = 3; // 3 tries per industry
+        const maxIndustryRetries = 3;
       let industryResult = null;
       
       while (industryRetries < maxIndustryRetries) {
         try {
-          industryResult = await scrapeGoogleMaps(industry, index, proxies, sharedBrowser, sharedPage);
-          
-          // If we got results, break out of retry loop
+            industryResult = await scrapeGoogleMaps(industry, workerId * 100 + index, proxies, browser, page);
+            
+            // Update browser/page references
+            if (industryResult.browser && industryResult.page) {
+              browser = industryResult.browser;
+              page = industryResult.page;
+              // Add to global browser list for shutdown
+              gracefulShutdown.browsers[workerId] = browser;
+            }
+            
           if (industryResult && industryResult.data && industryResult.data.length > 0) {
             break;
           }
           
-          // If no results and we haven't retried yet, try again
           if (industryRetries < maxIndustryRetries - 1) {
             industryRetries++;
-            console.log(`  ⚠️  No results for industry "${industry}", retrying... (${industryRetries}/${maxIndustryRetries})`);
-            await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before retry
+              console.log(`${workerPrefix}   ⚠️  No results, retrying... (${industryRetries}/${maxIndustryRetries})`);
+              await new Promise(resolve => setTimeout(resolve, 5000));
           } else {
-            break; // Exit retry loop
+              break;
           }
         } catch (error) {
           industryRetries++;
           
-          // Check if it's a blocking error
           const isBlockingError = error.message.includes('blocked') || 
                                   error.message.includes('blocking') ||
-                                  error.message.includes('unusual traffic');
+                                    error.message.includes('unusual traffic') ||
+                                    error.message.includes('CAPTCHA');
           
           if (isBlockingError && industryRetries < maxIndustryRetries) {
-            console.log(`  🚫 Blocking detected for industry "${industry}", retrying... (${industryRetries}/${maxIndustryRetries})`);
-            await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10s for blocks
+              console.log(`${workerPrefix}   🚫 Blocking detected, retrying... (${industryRetries}/${maxIndustryRetries})`);
+              await new Promise(resolve => setTimeout(resolve, 10000));
             continue;
           }
           
-          // If it's the last retry or not a blocking error, save debug and re-throw
           if (industryRetries >= maxIndustryRetries) {
-            console.log(`  ❌ Failed for industry "${industry}"`);
-            console.log(`  📸 Saving debug info...`);
-            
-            // Try to get page for screenshot
-            try {
-              if (sharedPage) {
-                await saveDebugInfo(sharedPage, 'industry_failed_after_retries', {
+              console.log(`${workerPrefix}   ❌ Failed for industry "${industry}"`);
+              if (page) {
+                try {
+                  await saveDebugInfo(page, `browser${workerId + 1}_industry_failed`, {
+                    workerId: workerId,
                   industry: industry,
-                  retries: industryRetries,
                   error: error.message
                 });
+                } catch (e) {}
               }
-            } catch (e) {
-              console.log(`  ⚠️  Could not save debug info: ${e.message}`);
+              throw error;
             }
             
-            throw error; // Re-throw to be caught by outer catch
-          }
-          
-          // Wait before retry
           await new Promise(resolve => setTimeout(resolve, 5000));
         }
       }
       
-      // If we still don't have results after retries, STOP the entire process
+        // Handle no results
       if (!industryResult || !industryResult.data || industryResult.data.length === 0) {
-        console.log(`  ❌ No results collected for industry "${industry}"`);
-        console.log('  📸 Saving debug info...');
-        try {
-          if (sharedPage) {
-            await saveDebugInfo(sharedPage, 'industry_no_results', {
-              industry: industry,
-              retries: industryRetries
-            });
-          }
-        } catch (e) {}
-        
-        // Add error entry to timing data
-        timingData.push({
+          consecutiveFailedIndustries++;
+          console.log(`${workerPrefix}   ❌ No results for "${industry}"`);
+          console.log(`${workerPrefix}   ⚠️  Consecutive failures: ${consecutiveFailedIndustries}/2`);
+          
+          workerTimingData.push({
           industry: industry,
-          startTime: 'Error',
-          endTime: 'Error',
-          durationSeconds: 0,
-          totalBusinessesFound: 0,
-          businessesKept: 0,
-          businessesFiltered: 0,
+            workerId: workerId + 1,
           error: 'No results after retries'
         });
         
-        // STOP the entire process - don't continue to next industry
-        console.log('\n🛑 STOPPING: No results collected. Shutting down...');
-        if (sharedBrowser) {
-          try {
-            await sharedBrowser.close();
-          } catch (e) {}
+          // Sync to global
+          gracefulShutdown.timingData.push(...workerTimingData.slice(-1));
+          
+          if (consecutiveFailedIndustries >= 2) {
+            console.log(`${workerPrefix} 🛑 2 consecutive failures - this browser is likely blocked`);
+            gracefulShutdown.browserStatus[workerId] = 'blocked';
+            break; // Exit this worker's loop
+          }
+          continue;
+        } else {
+          consecutiveFailedIndustries = 0;
         }
-        throw new Error(`No results collected for industry: ${industry}. Process stopped.`);
-      }
-      
-      // Update shared browser/page if we created new ones
-      if (industryResult.browser && industryResult.page) {
-        sharedBrowser = industryResult.browser;
-        sharedPage = industryResult.page;
-      }
-      
-      // Add industry information to each result
+        
+        // Add results with industry tag
       const resultsWithIndustry = industryResult.data.map(result => ({
         ...result,
-        Industry: industry // Add industry column to track which industry each business belongs to
-      }));
-      
-      allResults.push(...resultsWithIndustry);
-      businessesProcessed += industryResult.data.length;
-      
-      // Store timing data
-      timingData.push(industryResult.timing);
-      
-      console.log(`\n✅ Completed industry "${industry}": ${industryResult.data.length} businesses collected in ${industryResult.timing.durationSeconds} seconds`);
-      
-      // Add a randomized delay between industries to avoid rate limiting (except for the last one)
-      if (index < industries.length - 1) {
+          Industry: industry,
+          ScrapedBy: `Browser ${workerId + 1}`
+        }));
+        
+        workerResults.push(...resultsWithIndustry);
+        workerTimingData.push(industryResult.timing);
+        
+        // Note: Data is already synced in real-time during scrapeGoogleMaps
+        // Just update timing data and counter here (avoid duplicates)
+        gracefulShutdown.timingData.push(industryResult.timing);
+        gracefulShutdown.industriesProcessed++;
+        
+        console.log(`${workerPrefix} ✅ Completed "${industry}": ${industryResult.data.length} businesses`);
+        console.log(`${workerPrefix} 💾 Total in memory: ${gracefulShutdown.allResults.length} businesses`);
+        
+        // Delay between industries
+        if (index < industries.length - 1 && !gracefulShutdown.isShuttingDown) {
         const delay = getRandomDelay(MIN_DELAY_BETWEEN_INDUSTRIES, MAX_DELAY_BETWEEN_INDUSTRIES);
-        console.log(`⏳ Waiting ${Math.round(delay/1000)}s before processing next industry...\n`);
+          console.log(`${workerPrefix} ⏳ Waiting ${Math.round(delay/1000)}s before next industry...`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
+        
     } catch (error) {
-      console.error(`❌ Error processing industry "${industry}":`, error.message);
-      console.log('  📸 Saving debug info before continuing...');
+        consecutiveFailedIndustries++;
+        console.error(`${workerPrefix} ❌ Error: ${error.message}`);
       
-      // Try to save debug info
-      try {
-        if (sharedPage) {
-          await saveDebugInfo(sharedPage, 'industry_error', {
+        workerTimingData.push({
             industry: industry,
-            error: error.message,
-            stack: error.stack
-          });
+          workerId: workerId + 1,
+          error: error.message
+        });
+        gracefulShutdown.timingData.push(...workerTimingData.slice(-1));
+        
+        if (consecutiveFailedIndustries >= 2) {
+          console.log(`${workerPrefix} 🛑 2 consecutive failures - stopping this browser`);
+          gracefulShutdown.browserStatus[workerId] = 'blocked';
+          break;
         }
-      } catch (e) {
-        console.log(`  ⚠️  Could not save debug info: ${e.message}`);
       }
-      
-      console.log('Continuing with next industry...\n');
-      
-      // Add error entry to timing data
-      timingData.push({
-        industry: industry,
-        startTime: 'Error',
-        endTime: 'Error',
-        durationSeconds: 0,
-        totalBusinessesFound: 0,
-        businessesKept: 0,
-        businessesFiltered: 0,
-        error: error.message
-      });
-      // Continue with next industry even if one fails
+    }
+  } finally {
+    // Clean up browser
+    if (browser) {
+      try {
+        await browser.close();
+        gracefulShutdown.browsers[workerId] = null;
+      } catch (e) {}
+    }
+    
+    gracefulShutdown.browserStatus[workerId] = 'completed';
+    gracefulShutdown.currentIndustries[workerId] = null;
+    console.log(`${workerPrefix} 🏁 Worker finished. Collected ${workerResults.length} businesses.`);
+  }
+  
+  return {
+    workerId: workerId,
+    results: workerResults,
+    timingData: workerTimingData
+  };
+}
+
+// Main function to process all industries with parallel browsers
+async function processAllIndustries() {
+  const overallStartTime = Date.now();
+  const industries = readIndustriesFromFile();
+  
+  // Initialize graceful shutdown state
+  gracefulShutdown.overallStartTime = overallStartTime;
+  gracefulShutdown.totalIndustries = industries.length;
+  gracefulShutdown.browsers = new Array(NUM_PARALLEL_BROWSERS).fill(null);
+  gracefulShutdown.browserStatus = new Array(NUM_PARALLEL_BROWSERS).fill('pending');
+  gracefulShutdown.currentIndustries = new Array(NUM_PARALLEL_BROWSERS).fill(null);
+  
+  // Load proxies if enabled
+  const proxies = USE_PROXIES ? loadProxies() : [];
+  if (USE_PROXIES && proxies.length === 0) {
+    console.log('⚠️  WARNING: Proxy rotation enabled but no proxies found!');
+  }
+  
+  console.log('\n' + '='.repeat(70));
+  console.log('🚀 PARALLEL BROWSER SCRAPER');
+  console.log('='.repeat(70));
+  console.log(`📋 Total industries: ${industries.length}`);
+  console.log(`🌐 Parallel browsers: ${NUM_PARALLEL_BROWSERS}`);
+  console.log(`📊 Industries per browser: ~${Math.ceil(industries.length / NUM_PARALLEL_BROWSERS)}`);
+  console.log(`⏰ Start time: ${new Date(overallStartTime).toISOString()}`);
+  console.log(`💾 Graceful shutdown: ENABLED - Press Ctrl+C to save all data and exit`);
+  console.log('='.repeat(70) + '\n');
+  
+  // Split industries among browsers
+  const industriesPerBrowser = [];
+  for (let i = 0; i < NUM_PARALLEL_BROWSERS; i++) {
+    industriesPerBrowser.push([]);
+  }
+  
+  // Distribute industries round-robin style for better balance
+  industries.forEach((industry, index) => {
+    industriesPerBrowser[index % NUM_PARALLEL_BROWSERS].push(industry);
+  });
+  
+  // Log distribution
+  for (let i = 0; i < NUM_PARALLEL_BROWSERS; i++) {
+    console.log(`Browser ${i + 1} will process: ${industriesPerBrowser[i].join(', ')}`);
+  }
+  console.log('\n');
+  
+  // Start all browser workers in parallel
+  const workerPromises = [];
+  for (let i = 0; i < NUM_PARALLEL_BROWSERS; i++) {
+    if (industriesPerBrowser[i].length > 0) {
+      // Stagger browser starts to avoid simultaneous connections
+      await new Promise(resolve => setTimeout(resolve, i * 3000)); // 3 second delay between browser starts
+      workerPromises.push(browserWorker(i, industriesPerBrowser[i], proxies));
     }
   }
   
-  // Close shared browser if still open
-  if (sharedBrowser) {
-    try {
-      await sharedBrowser.close();
-    } catch (e) {
-      console.log(`Error closing shared browser: ${e.message}`);
-    }
+  // Wait for all workers to complete
+  console.log(`\n⏳ Waiting for all ${workerPromises.length} browser workers to complete...\n`);
+  
+  try {
+    const results = await Promise.allSettled(workerPromises);
+    
+    // Check results
+    let successCount = 0;
+    let failCount = 0;
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        successCount++;
+        console.log(`✅ Browser ${index + 1}: Completed successfully`);
+      } else {
+        failCount++;
+        console.log(`❌ Browser ${index + 1}: Failed - ${result.reason}`);
+      }
+    });
+    
+    console.log(`\n📊 Workers completed: ${successCount} success, ${failCount} failed`);
+    
+  } catch (error) {
+    console.error('Error in parallel processing:', error);
   }
   
-  const overallEndTime = Date.now(); // Track overall end time
-  const overallDuration = ((overallEndTime - overallStartTime) / 1000).toFixed(2); // Duration in seconds
+  // Check if shutdown was triggered
+  if (gracefulShutdown.isShuttingDown) {
+    return; // Data already saved by shutdown handler
+  }
   
-  // Create analysis data for the "scraper analyzing" sheet
+  const overallEndTime = Date.now();
+  const overallDuration = ((overallEndTime - overallStartTime) / 1000).toFixed(2);
+  
+  // Create analysis data
   const analysisData = [
-    {
-      Metric: 'Overall Start Time',
-      Value: new Date(overallStartTime).toISOString()
-    },
-    {
-      Metric: 'Overall End Time',
-      Value: new Date(overallEndTime).toISOString()
-    },
-    {
-      Metric: 'Total Duration (seconds)',
-      Value: parseFloat(overallDuration)
-    },
-    {
-      Metric: 'Total Duration (minutes)',
-      Value: (parseFloat(overallDuration) / 60).toFixed(2)
-    },
-    {
-      Metric: 'Total Duration (hours)',
-      Value: (parseFloat(overallDuration) / 3600).toFixed(2)
-    },
-    {
-      Metric: 'Total Industries Processed',
-      Value: industries.length
-    },
-    {
-      Metric: 'Total Businesses Collected',
-      Value: allResults.length
-    },
-    {
-      Metric: 'Average Time per Industry (seconds)',
-      Value: timingData.length > 0 ? (timingData.reduce((sum, t) => sum + (t.durationSeconds || 0), 0) / timingData.length).toFixed(2) : 0
-    },
-    {
-      Metric: 'Average Businesses per Industry',
-      Value: timingData.length > 0 ? (timingData.reduce((sum, t) => sum + (t.businessesKept || 0), 0) / timingData.length).toFixed(2) : 0
-    }
+    { Metric: 'Overall Start Time', Value: new Date(overallStartTime).toISOString() },
+    { Metric: 'Overall End Time', Value: new Date(overallEndTime).toISOString() },
+    { Metric: 'Total Duration (seconds)', Value: parseFloat(overallDuration) },
+    { Metric: 'Total Duration (minutes)', Value: (parseFloat(overallDuration) / 60).toFixed(2) },
+    { Metric: 'Total Duration (hours)', Value: (parseFloat(overallDuration) / 3600).toFixed(2) },
+    { Metric: 'Parallel Browsers Used', Value: NUM_PARALLEL_BROWSERS },
+    { Metric: 'Total Industries Processed', Value: gracefulShutdown.industriesProcessed },
+    { Metric: 'Total Businesses Collected', Value: gracefulShutdown.allResults.length }
   ];
   
+  // Add per-browser breakdown
+  for (let i = 0; i < NUM_PARALLEL_BROWSERS; i++) {
+    const browserResults = gracefulShutdown.allResults.filter(r => r.ScrapedBy === `Browser ${i + 1}`);
+    analysisData.push({ Metric: `Browser ${i + 1} - Status`, Value: gracefulShutdown.browserStatus[i] });
+    analysisData.push({ Metric: `Browser ${i + 1} - Businesses`, Value: browserResults.length });
+  }
+  
   // Add per-industry breakdown
-  timingData.forEach(timing => {
-    analysisData.push({
-      Metric: `Industry: ${timing.industry}`,
-      Value: ''
-    });
-    analysisData.push({
-      Metric: `  - Duration (seconds)`,
-      Value: timing.durationSeconds || 0
-    });
-    analysisData.push({
-      Metric: `  - Total Businesses Found`,
-      Value: timing.totalBusinessesFound || 0
-    });
-    analysisData.push({
-      Metric: `  - Businesses Kept`,
-      Value: timing.businessesKept || 0
-    });
-    analysisData.push({
-      Metric: `  - Businesses Filtered`,
-      Value: timing.businessesFiltered || 0
-    });
+  gracefulShutdown.timingData.forEach(timing => {
+    if (timing.industry) {
+      analysisData.push({ Metric: `Industry: ${timing.industry}`, Value: '' });
+      if (timing.durationSeconds) {
+        analysisData.push({ Metric: `  - Duration (seconds)`, Value: timing.durationSeconds });
+      }
+      if (timing.businessesKept !== undefined) {
+        analysisData.push({ Metric: `  - Businesses Kept`, Value: timing.businessesKept });
+      }
     if (timing.error) {
-      analysisData.push({
-        Metric: `  - Error`,
-        Value: timing.error
-      });
+        analysisData.push({ Metric: `  - Error`, Value: timing.error });
+      }
     }
   });
 
   // Create and write the combined Excel file
-  console.log(`\n${'='.repeat(60)}`);
-  console.log('Creating combined Excel file with all industries...');
-  console.log(`Total duration: ${overallDuration} seconds (${(parseFloat(overallDuration) / 60).toFixed(2)} minutes)`);
-  console.log(`${'='.repeat(60)}\n`);
+  console.log(`\n${'='.repeat(70)}`);
+  console.log('📁 Creating combined Excel file with all industries...');
+  console.log(`⏱️  Total duration: ${overallDuration} seconds (${(parseFloat(overallDuration) / 60).toFixed(2)} minutes)`);
+  console.log(`📊 Total businesses (before dedup): ${gracefulShutdown.allResults.length}`);
   
-  const workbook = xlsx.utils.book_new(); // Create a new workbook
-  const worksheet = xlsx.utils.json_to_sheet(allResults); // Convert all data to a worksheet
-  xlsx.utils.book_append_sheet(workbook, worksheet, 'Results'); // Append the worksheet to the workbook
+  // Deduplicate results based on business name + address
+  const seenBusinesses = new Set();
+  const deduplicatedResults = gracefulShutdown.allResults.filter(business => {
+    const key = `${business.Name}|${business.Address}`.toLowerCase();
+    if (seenBusinesses.has(key)) {
+      return false; // Skip duplicate
+    }
+    seenBusinesses.add(key);
+    return true;
+  });
   
-  // Create the analysis worksheet
+  const duplicatesRemoved = gracefulShutdown.allResults.length - deduplicatedResults.length;
+  console.log(`📊 Duplicates removed: ${duplicatesRemoved}`);
+  console.log(`📊 Total businesses (after dedup): ${deduplicatedResults.length}`);
+  console.log(`${'='.repeat(70)}\n`);
+  
+  const workbook = xlsx.utils.book_new();
+  const worksheet = xlsx.utils.json_to_sheet(deduplicatedResults);
+  xlsx.utils.book_append_sheet(workbook, worksheet, 'Results');
+  
   const analysisWorksheet = xlsx.utils.json_to_sheet(analysisData);
-  xlsx.utils.book_append_sheet(workbook, analysisWorksheet, 'scraper analyzing'); // Append the analysis worksheet
+  xlsx.utils.book_append_sheet(workbook, analysisWorksheet, 'scraper analyzing');
 
-  // Write the Excel file to disk with timestamp to avoid locking issues
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const filename = `GoogleMapsResults_${timestamp}.xlsx`;
   
   try {
     xlsx.writeFile(workbook, filename); 
     console.log(`✅ Excel file "${filename}" has been created successfully.`);
-    console.log(`Total businesses collected: ${allResults.length}`);
-    console.log(`Analysis data saved to "scraper analyzing" sheet.`);
+    console.log(`📊 Total businesses collected: ${gracefulShutdown.allResults.length}`);
   } catch (error) {
     if (error.code === 'EBUSY') {
-      console.log('File is locked, trying with a different name...');
       const altFilename = `GoogleMapsResults_${Date.now()}.xlsx`;
       xlsx.writeFile(workbook, altFilename);
       console.log(`✅ Excel file "${altFilename}" has been created successfully.`);
-      console.log(`Total businesses collected: ${allResults.length}`);
-      console.log(`Analysis data saved to "scraper analyzing" sheet.`);
     } else {
       throw error;
     }

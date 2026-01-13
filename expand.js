@@ -23,79 +23,42 @@ const MANUAL_SELECTORS = {
 // Function to scrape Proff.no for contact person/owner name
 async function scrapeProffContactPerson(businessName, page) {
   try {
-    // Use Google search to find Proff.no page for the business
-    // No quotes around business name - allows Google to find most relevant match even if name differs slightly
-    const googleSearchQuery = `${businessName} site:proff.no`;
-    const encodedQuery = encodeURIComponent(googleSearchQuery);
-    const googleSearchUrl = `https://www.google.com/search?q=${encodedQuery}`;
+    // Use DuckDuckGo - supports site: operator properly and low bot blocking
+    const searchQuery = `${businessName} site:proff.no`;
+    const encodedQuery = encodeURIComponent(searchQuery);
+    const searchUrl = `https://duckduckgo.com/?q=${encodedQuery}`;
     
-    console.log(`  🔍 Google searching: ${businessName} proff.no`);
+    console.log(`  🔍 DuckDuckGo: ${businessName} site:proff.no`);
     
-    // Navigate to Google search with retry logic
-    let googleLoaded = false;
-    for (let retry = 0; retry < 2; retry++) {
-      try {
-        await page.goto(googleSearchUrl, { waitUntil: 'load', timeout: 20000 });
-        googleLoaded = true;
-        break;
-      } catch (e) {
-        if (retry === 1) {
-          // On last retry, try with even shorter timeout
-          try {
-            await page.goto(googleSearchUrl, { waitUntil: 'load', timeout: 10000 });
-            googleLoaded = true;
-          } catch (e2) {
-            console.log(`  ⚠️  Google search timeout, continuing anyway...`);
-            await new Promise(resolve => setTimeout(resolve, 5000));
-          }
-        }
-      }
-    }
-    
-    // Handle Google consent if it appears
+    // Navigate to DuckDuckGo search
     try {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const consentSelectors = [
-        'button[aria-label*="Accept"]',
-        'button[aria-label*="Godta"]',
-        '#L2AGLb',
-        'button:contains("Accept all")',
-        'button:contains("Godta alle")'
-      ];
-      
-      for (const selector of consentSelectors) {
-        try {
-          const consentButton = await page.$(selector);
-          if (consentButton) {
-            console.log(`  🔘 Clicking Google consent button...`);
-            await consentButton.click();
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            break;
-          }
-        } catch (e) {
-          // Continue to next selector
-        }
-      }
+      await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     } catch (e) {
-      // No consent popup
+      // If timeout, try with shorter timeout
+      try {
+        await page.goto(searchUrl, { waitUntil: 'load', timeout: 15000 });
+      } catch (e2) {
+        console.log(`  ⚠️  Search timeout, continuing anyway...`);
+      }
     }
     
-    // Wait for search results to load
+    // Wait for search results to load (DuckDuckGo uses JavaScript rendering)
     await new Promise(resolve => setTimeout(resolve, 3000));
     
-    // Find and click the first Proff.no result from Google
+    // Find and click the first Proff.no result
     let proffUrl = null;
     try {
       // Find the first result that links to proff.no
       proffUrl = await page.evaluate(() => {
-        // Try multiple selectors for Google search results
+        // DuckDuckGo result selectors
         const resultSelectors = [
-          'a[href*="proff.no"]',
+          'a[href*="proff.no/selskap"]',
           'a[href*="proff.no/bedrift"]',
           'a[href*="proff.no/firma"]',
-          'a[href*="proff.no/selskap"]',
-          '.g a[href*="proff.no"]',
-          'h3 a[href*="proff.no"]'
+          'article a[href*="proff.no"]',
+          '[data-testid="result"] a[href*="proff.no"]',
+          '.result__a[href*="proff.no"]',
+          'a.result__url[href*="proff.no"]'
         ];
         
         for (const selector of resultSelectors) {
@@ -103,27 +66,39 @@ async function scrapeProffContactPerson(businessName, page) {
           for (const link of links) {
             const href = link.href || link.getAttribute('href');
             if (href && href.includes('proff.no') && 
-                (href.includes('/bedrift/') || href.includes('/firma/') || href.includes('/selskap/'))) {
+                (href.includes('/selskap/') || href.includes('/bedrift/') || href.includes('/firma/'))) {
               return href;
             }
           }
         }
         
-        // Fallback: get any proff.no link from search results
+        // Fallback: get any proff.no link from results
         const allLinks = document.querySelectorAll('a[href*="proff.no"]');
-        if (allLinks.length > 0) {
-          const href = allLinks[0].href || allLinks[0].getAttribute('href');
-          if (href) return href;
+        for (const link of allLinks) {
+          const href = link.href || link.getAttribute('href');
+          // Skip DuckDuckGo's redirect wrapper if present
+          if (href && href.includes('proff.no') && !href.includes('duckduckgo.com')) {
+            return href;
+          }
         }
         
         return null;
       });
       
+      // Handle DuckDuckGo redirect URLs (they sometimes wrap links)
+      if (proffUrl && proffUrl.includes('uddg=')) {
+        const match = proffUrl.match(/uddg=([^&]+)/);
+        if (match) {
+          proffUrl = decodeURIComponent(match[1]);
+        }
+      }
+      
       if (proffUrl) {
+        
         console.log(`  🔗 Found Proff.no link: ${proffUrl}`);
         // Navigate directly to the Proff.no page
         try {
-          await page.goto(proffUrl, { waitUntil: 'load', timeout: 20000 });
+          await page.goto(proffUrl, { waitUntil: 'networkidle2', timeout: 20000 });
         } catch (e) {
           // If timeout, try with shorter timeout
           try {
@@ -132,14 +107,14 @@ async function scrapeProffContactPerson(businessName, page) {
             console.log(`  ⚠️  Proff.no page timeout, continuing anyway...`);
           }
         }
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
-        console.log(`  ⚠️  No Proff.no result found in Google search`);
-        return 'Not found';
+        console.log(`  ⚠️  No Proff.no result found in search`);
+        return { contactPerson: 'Not found', businessPhone: 'Not found' };
       }
     } catch (e) {
       console.log(`  ❌ Error finding Proff.no link: ${e.message}`);
-      return 'Not found';
+      return { contactPerson: 'Not found', businessPhone: 'Not found' };
     }
     
     // Handle Proff.no consent if it appears
@@ -546,10 +521,7 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     console.log(`📄 Using specified file: ${excelFilename}`);
   }
   
-  // Create backup
-  backupExcelFile(excelFilename);
-  
-  // Read the Excel file
+  // Read the Excel file (no backup - we save progress continuously)
   console.log('\n📖 Reading Excel file...');
   const workbook = xlsx.readFile(excelFilename);
   const worksheet = workbook.Sheets[workbook.SheetNames[0]];
@@ -584,39 +556,48 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     });
   }
   
-  // Launch browser
-  console.log('🌐 Launching browser...');
-  const browser = await puppeteer.launch({ 
-    headless: false,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=VizDisplayCompositor'
-    ]
-  });
+  // Browser launch function (reusable for restarts)
+  const BROWSER_RESTART_INTERVAL = 100; // Restart browser every 100 businesses to prevent memory issues
   
-  const page = await browser.newPage();
-  
-  // Set user agent
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-  
-  // Set additional headers
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'en-US,en;q=0.9,no;q=0.8'
-  });
-  
-  // Hide automation indicators
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
+  async function launchBrowser() {
+    console.log('🌐 Launching browser...');
+    const newBrowser = await puppeteer.launch({ 
+      headless: false,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=VizDisplayCompositor'
+      ]
     });
-  });
+    
+    const newPage = await newBrowser.newPage();
+    
+    // Set user agent
+    await newPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+    
+    // Set additional headers
+    await newPage.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9,no;q=0.8'
+    });
+    
+    // Hide automation indicators
+    await newPage.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+    });
+    
+    return { browser: newBrowser, page: newPage };
+  }
+  
+  let { browser, page } = await launchBrowser();
+  let processedSinceRestart = 0; // Track businesses processed since last browser restart
   
   let updatedCount = 0;
   let foundCount = 0;
@@ -651,21 +632,14 @@ async function expandExcelWithContactPersons(excelFilename = null) {
         xlsx.utils.book_append_sheet(newWorkbook, sheet, workbook.SheetNames[i]);
       }
       
-      // Use a consistent filename for latest progress (overwrites previous)
-      const progressFilename = excelFilename.replace('.xlsx', '_PROGRESS_SAVE.xlsx');
+      // Use a consistent filename for progress (overwrites previous - only 1 file)
+      const progressFilename = excelFilename.replace('.xlsx', '_EXPANDED.xlsx');
       xlsx.writeFile(newWorkbook, progressFilename);
       lastSavedFilename = progressFilename;
       
-      // Also save with timestamp for backup
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const backupFilename = excelFilename.replace('.xlsx', `_expanded_${timestamp}.xlsx`);
-      xlsx.writeFile(newWorkbook, backupFilename);
-      
-      // Only log every 10th save to avoid spam, but always save
+      // Only log every 10th save to avoid spam
       if (updatedCount % 10 === 0 || force) {
-        console.log(`\n💾 Progress saved! (${updatedCount} businesses processed)`);
-        console.log(`   Latest: ${progressFilename}`);
-        console.log(`   Backup: ${backupFilename}`);
+        console.log(`\n💾 Progress saved to: ${progressFilename} (${updatedCount} processed)`);
       }
       return progressFilename;
     } catch (error) {
@@ -770,31 +744,27 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     console.log(`🧪 TESTING MODE: Processing only first ${TEST_LIMIT} businesses\n`);
   }
   
+  // START_FROM_INDEX: Set to skip already processed businesses (0 = start from beginning)
+  const START_FROM_INDEX = 376; // Change this to resume from a specific point
+  
+  if (START_FROM_INDEX > 0) {
+    console.log(`⏭️  Skipping first ${START_FROM_INDEX} businesses, starting at #${START_FROM_INDEX + 1}\n`);
+    skippedCount = START_FROM_INDEX;
+  }
+  
   // Process each business
   for (const [index, business] of businessesToProcess.entries()) {
+    // Skip to start index
+    if (index < START_FROM_INDEX) {
+      continue;
+    }
+    
     // Check if we should stop
     if (shouldStop) {
       console.log('\n⚠️  Stopping processing...');
       break;
     }
     const businessName = business.Name || business.name || 'Unknown';
-    const currentContactPerson = business['Contact Person'] || business['contact person'] || '';
-    
-    // Skip if contact person already exists and is not "Not found"
-    // But still process if Business Phone is missing
-    const currentBusinessPhone = business['Business Phone'] || business['business phone'] || '';
-    const shouldSkip = currentContactPerson && 
-                       currentContactPerson !== 'Not found' && 
-                       currentContactPerson.trim().length > 0 &&
-                       currentBusinessPhone && 
-                       currentBusinessPhone !== 'Not found' &&
-                       currentBusinessPhone.trim().length > 0;
-    
-    if (shouldSkip) {
-      console.log(`\n[${index + 1}/${businessesToProcess.length}] ⏭️  Skipping ${businessName} - Already has contact person and business phone`);
-      skippedCount++;
-      continue;
-    }
     
     console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 Processing: ${businessName}`);
     
@@ -823,6 +793,24 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       // CRITICAL: Save progress after EVERY business to prevent data loss
       // This ensures we never lose more than 1 business worth of data
       await saveProgress();
+      
+      // Increment restart counter
+      processedSinceRestart++;
+      
+      // Restart browser every 100 businesses to prevent memory issues
+      if (processedSinceRestart >= BROWSER_RESTART_INTERVAL && index < businessesToProcess.length - 1 && !shouldStop) {
+        console.log(`\n🔄 Restarting browser after ${BROWSER_RESTART_INTERVAL} businesses to prevent memory issues...`);
+        try {
+          await browser.close();
+        } catch (e) {
+          console.log(`  ⚠️  Error closing browser: ${e.message}`);
+        }
+        const newSession = await launchBrowser();
+        browser = newSession.browser;
+        page = newSession.page;
+        processedSinceRestart = 0;
+        console.log(`✅ Browser restarted successfully!\n`);
+      }
       
       // Rate limiting: wait 2-3 seconds between requests
       if (index < businessesToProcess.length - 1 && !shouldStop) {
