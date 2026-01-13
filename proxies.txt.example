@@ -1,0 +1,20 @@
+# Proxy Configuration File
+# Format: One proxy per line
+# Format 1: ip:port (for proxies without authentication)
+# Format 2: ip:port:username:password (for authenticated proxies)
+#
+# Examples:
+# 123.45.67.89:8080
+# 98.76.54.32:3128:myuser:mypass
+#
+# Lines starting with # are ignored
+#
+# Recommended: Use residential proxies from services like:
+# - Bright Data (luminati.io)
+# - Oxylabs
+# - Smartproxy
+# - Proxy-Cheap
+#
+# For heavy scraping (6000+ businesses), you'll need at least 10-20 proxies
+# Rotate them every 50 businesses to avoid detection
+

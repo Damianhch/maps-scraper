@@ -1,1 +1,20 @@
-restaurant
+cafe
+bar
+bakery
+catering
+food truck
+clinic
+dentist
+physiotherapist
+therapist
+massage
+salon
+barbershop
+tattoo studio
+beauty spa
+gym
+yoga studio
+personal trainer
+photographer
+videographer
+graphic designer
