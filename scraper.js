@@ -1733,6 +1733,62 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
           }
         }
         
+        // Extract review count
+        let reviewCount = 0;
+        try {
+          reviewCount = await page.evaluate(() => {
+            // Method 1: Look for aria-label with review count (most reliable)
+            const reviewSelectors = [
+              '[aria-label*="reviews"]',
+              '[aria-label*="anmeldelser"]', // Norwegian
+              '[aria-label*="review"]',
+              'button[jsaction*="reviews"]',
+              'span[aria-label*="("]'
+            ];
+            
+            for (const selector of reviewSelectors) {
+              const elements = document.querySelectorAll(selector);
+              for (const el of elements) {
+                const ariaLabel = el.getAttribute('aria-label') || '';
+                const text = el.textContent || '';
+                
+                // Try to extract number from patterns like "4.5 stars 123 reviews" or "(123)"
+                const patterns = [
+                  /(\d+)\s*(?:reviews|anmeldelser|omtaler)/i,
+                  /\((\d+)\)/,
+                  /(\d+)\s*(?:Google\s*)?(?:reviews|anmeldelser)/i
+                ];
+                
+                for (const pattern of patterns) {
+                  const match = (ariaLabel + ' ' + text).match(pattern);
+                  if (match && parseInt(match[1]) > 0) {
+                    return parseInt(match[1]);
+                  }
+                }
+              }
+            }
+            
+            // Method 2: Look in page text for review count patterns
+            const bodyText = document.body.innerText || '';
+            const textPatterns = [
+              /(\d+)\s*(?:Google\s*)?(?:reviews|anmeldelser|omtaler)/i,
+              /\((\d+)\)\s*(?:reviews|anmeldelser)?/i
+            ];
+            
+            for (const pattern of textPatterns) {
+              const match = bodyText.match(pattern);
+              if (match && parseInt(match[1]) > 0) {
+                return parseInt(match[1]);
+              }
+            }
+            
+            return 0;
+          });
+        } catch (e) {
+          console.log('  Could not extract review count:', e.message);
+          reviewCount = 0;
+        }
+        
         // Extract hours
         const hoursSelectors = [
           '[data-item-id="oh"]',
@@ -1827,8 +1883,18 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
       console.log(`Website (original): ${website}`);
       console.log(`Phone: ${phone}`);
       console.log(`Rating: ${rating}`);
+      console.log(`Review Count: ${reviewCount}`);
       console.log(`Hours: ${hours}`);
       console.log(`Price Level: ${priceLevel}`);
+
+      // QUALITY FILTER 1: Check review count (minimum 7 reviews required)
+      const MIN_REVIEW_COUNT = 7;
+      if (reviewCount < MIN_REVIEW_COUNT) {
+        console.log(`❌ SKIPPING ${businessName} - Only ${reviewCount} reviews (minimum ${MIN_REVIEW_COUNT} required)`);
+        console.log('---------------------------');
+        continue; // Skip this business - not enough reviews
+      }
+      console.log(`✅ Review check passed: ${reviewCount} reviews`);
 
       if (hasRealWebsite) {
         console.log(`❌ SKIPPING ${businessName} - Has real business website: ${website}`);
@@ -1858,6 +1924,7 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
         'Contact Person': 'Not found', // Will be filled by expand.js
         'Business Phone': 'Not found', // Will be filled by expand.js from Proff.no
         Rating: rating || '',
+        'Review Count': reviewCount, // Number of Google reviews
         Hours: hours || '',
         PriceLevel: priceLevel || '',
         Industry: industry // Add industry tag for real-time sync
@@ -1999,8 +2066,9 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
   if (TEST_LIMIT) {
     console.log(`🧪 TESTING MODE: Processed ${businessesToProcess.length} of ${results.length} businesses`);
   }
-  console.log(`Businesses KEPT (no real website): ${excelData.length}`);
-  console.log(`Businesses FILTERED OUT (have real website): ${businessesToProcess.length - excelData.length}`);
+  console.log(`Businesses KEPT (7+ reviews, no website): ${excelData.length}`);
+  console.log(`Businesses FILTERED OUT: ${businessesToProcess.length - excelData.length}`);
+  console.log(`  - Reasons: <7 reviews, has real website`);
   console.log(`Time taken: ${industryDuration} seconds`);
   console.log('========================\n');
 

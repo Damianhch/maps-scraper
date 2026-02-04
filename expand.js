@@ -435,9 +435,134 @@ async function scrapeProffContactPerson(businessName, page) {
         }
       }
       
+      // Extract Selskapsform (company type) and Antall ansatte (employee count)
+      // Using specific Proff.no HTML selectors
+      let selskapsform = null;
+      let antallAnsatte = null;
+      
+      // Method 1: Use specific Proff.no selectors (OfficialCompanyInformationCard)
+      try {
+        // Find all property containers in the official company info card
+        const propertyContainers = document.querySelectorAll('.OfficialCompanyInformationCard-propertyList, [class*="OfficialCompanyInformationCard"]');
+        
+        propertyContainers.forEach(container => {
+          const text = container.textContent || '';
+          
+          // Look for Selskapsform
+          if (text.toLowerCase().includes('selskapsform') || text.toLowerCase().includes('organisasjonsform')) {
+            // Find the property value element
+            const valueElements = container.querySelectorAll('.OfficialCompanyInformationCard-propertyValue, [class*="propertyValue"]');
+            valueElements.forEach(valueEl => {
+              const value = valueEl.textContent?.trim();
+              if (value && !selskapsform) {
+                selskapsform = value;
+              }
+            });
+          }
+          
+          // Look for Antall ansatte (employee count)
+          if (text.toLowerCase().includes('antall ansatte') || text.toLowerCase().includes('ansatte')) {
+            const valueElements = container.querySelectorAll('.OfficialCompanyInformationCard-propertyValue, [class*="propertyValue"]');
+            valueElements.forEach(valueEl => {
+              const value = valueEl.textContent?.trim();
+              // Extract number from text like "5" or "5-10" or "10+"
+              const numMatch = value?.match(/(\d+)/);
+              if (numMatch && !antallAnsatte) {
+                antallAnsatte = value;
+              }
+            });
+          }
+        });
+        
+        // Also try MuiGrid containers
+        const muiGridContainers = document.querySelectorAll('.MuiGrid-root.MuiGrid-grid-xs-12.MuiGrid-grid-md-6');
+        muiGridContainers.forEach(container => {
+          const text = container.textContent || '';
+          
+          if (text.toLowerCase().includes('selskapsform') && !selskapsform) {
+            const valueEl = container.querySelector('.OfficialCompanyInformationCard-propertyValue');
+            if (valueEl) {
+              selskapsform = valueEl.textContent?.trim();
+            }
+          }
+          
+          if (text.toLowerCase().includes('antall ansatte') && !antallAnsatte) {
+            const valueEl = container.querySelector('.OfficialCompanyInformationCard-propertyValue');
+            if (valueEl) {
+              antallAnsatte = valueEl.textContent?.trim();
+            }
+          }
+        });
+      } catch (e) {
+        // Continue to fallback methods
+      }
+      
+      // Method 2: Fallback - text-based search
+      if (!selskapsform) {
+        const companyTypeLabels = ['Selskapsform', 'Organisasjonsform', 'Foretaksform'];
+        
+        for (const label of companyTypeLabels) {
+          const labelIndex = bodyText.indexOf(label);
+          if (labelIndex !== -1) {
+            const afterLabel = bodyText.substring(labelIndex + label.length, labelIndex + label.length + 100);
+            
+            // Common Norwegian company types
+            const companyTypes = [
+              { pattern: 'enkeltpersonforetak', short: 'ENK' },
+              { pattern: 'aksjeselskap', short: 'AS' },
+              { pattern: 'ansvarlig selskap', short: 'ANS' },
+              { pattern: 'delt ansvar', short: 'DA' },
+              { pattern: 'norskregistrert utenlandsk foretak', short: 'NUF' },
+              { pattern: 'samvirkeforetak', short: 'SA' },
+              { pattern: 'allmennaksjeselskap', short: 'ASA' },
+              { pattern: 'stiftelse', short: 'Stiftelse' }
+            ];
+            
+            for (const type of companyTypes) {
+              if (afterLabel.toLowerCase().includes(type.pattern)) {
+                selskapsform = type.short;
+                break;
+              }
+            }
+            
+            // If still not found, try to extract the raw value
+            if (!selskapsform) {
+              const rawMatch = afterLabel.match(/^\s*:?\s*([A-ZÆØÅa-zæøå\s]+)/);
+              if (rawMatch && rawMatch[1].trim().length > 1) {
+                selskapsform = rawMatch[1].trim();
+              }
+            }
+            
+            if (selskapsform) break;
+          }
+        }
+      }
+      
+      // Method 3: Last resort - look for abbreviations
+      if (!selskapsform) {
+        const asMatch = bodyText.match(/\b(ENK|AS|ANS|DA|NUF|SA|ASA)\b/);
+        if (asMatch) {
+          selskapsform = asMatch[1];
+        }
+      }
+      
+      // Extract antall ansatte from text if not found via selectors
+      if (!antallAnsatte) {
+        const ansatteIndex = bodyText.indexOf('Antall ansatte');
+        if (ansatteIndex !== -1) {
+          const afterAnsatte = bodyText.substring(ansatteIndex + 14, ansatteIndex + 50);
+          const numMatch = afterAnsatte.match(/(\d+[-–]?\d*\+?)/);
+          if (numMatch) {
+            antallAnsatte = numMatch[1];
+          }
+        }
+      }
+      
       return {
         contactPerson: contactPerson,
-        businessPhone: businessPhone
+        businessPhone: businessPhone,
+        selskapsform: selskapsform,
+        antallAnsatte: antallAnsatte
       };
     });
     
@@ -452,10 +577,12 @@ async function scrapeProffContactPerson(businessName, page) {
       cleanedContactPerson = cleanedContactPerson.replace(/^(Daglig leder|Styrets leder|Styreleder|Administrerende direktør|CEO|Kontaktperson)[:\s]*/i, '').trim();
     }
     
-    // Return both contact person and business phone
+    // Return contact person, business phone, selskapsform, and employee count
     const finalResult = {
       contactPerson: cleanedContactPerson || 'Not found',
-      businessPhone: extractedData.businessPhone || 'Not found'
+      businessPhone: extractedData.businessPhone || 'Not found',
+      selskapsform: extractedData.selskapsform || 'Not found',
+      antallAnsatte: extractedData.antallAnsatte || 'Not found'
     };
     
     if (cleanedContactPerson) {
@@ -470,13 +597,27 @@ async function scrapeProffContactPerson(businessName, page) {
       console.log(`  ⚠️  No business phone found on Proff.no page`);
     }
     
+    if (extractedData.selskapsform) {
+      console.log(`  🏢 Found selskapsform: ${extractedData.selskapsform}`);
+    } else {
+      console.log(`  ⚠️  No selskapsform found on Proff.no page`);
+    }
+    
+    if (extractedData.antallAnsatte) {
+      console.log(`  👥 Found antall ansatte: ${extractedData.antallAnsatte}`);
+    } else {
+      console.log(`  ⚠️  No employee count found on Proff.no page`);
+    }
+    
     return finalResult;
     
   } catch (error) {
     console.log(`  ❌ Error scraping Proff.no: ${error.message}`);
     return {
       contactPerson: 'Not found',
-      businessPhone: 'Not found'
+      businessPhone: 'Not found',
+      selskapsform: 'Not found',
+      antallAnsatte: 'Not found'
     };
   }
 }
@@ -534,9 +675,10 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   
   console.log(`✅ Found ${data.length} businesses to process\n`);
   
-  // Check if Contact Person and Business Phone columns exist, if not add them
+  // Check if Contact Person, Business Phone, and Selskapsform columns exist, if not add them
   const hasContactPersonColumn = data.length > 0 && 'Contact Person' in data[0];
   const hasBusinessPhoneColumn = data.length > 0 && 'Business Phone' in data[0];
+  const hasSelskapsformColumn = data.length > 0 && 'Selskapsform' in data[0];
   
   if (!hasContactPersonColumn) {
     console.log('📝 Adding "Contact Person" column to data...');
@@ -552,6 +694,25 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     data.forEach(row => {
       if (!row['Business Phone']) {
         row['Business Phone'] = 'Not found';
+      }
+    });
+  }
+  
+  if (!hasSelskapsformColumn) {
+    console.log('📝 Adding "Selskapsform" column to data...');
+    data.forEach(row => {
+      if (!row['Selskapsform']) {
+        row['Selskapsform'] = 'Not found';
+      }
+    });
+  }
+  
+  const hasAntallAnsatteColumn = data.length > 0 && 'Antall Ansatte' in data[0];
+  if (!hasAntallAnsatteColumn) {
+    console.log('📝 Adding "Antall Ansatte" column to data...');
+    data.forEach(row => {
+      if (!row['Antall Ansatte']) {
+        row['Antall Ansatte'] = 'Not found';
       }
     });
   }
@@ -774,12 +935,16 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       // Update the business object (which is a reference to data array when TEST_LIMIT is null)
       business['Contact Person'] = result.contactPerson;
       business['Business Phone'] = result.businessPhone;
+      business['Selskapsform'] = result.selskapsform;
+      business['Antall Ansatte'] = result.antallAnsatte;
       
       // Also update directly in data array to ensure it's saved (in case of reference issues)
       const dataIndex = data.findIndex(b => (b.Name || b.name) === businessName);
       if (dataIndex !== -1) {
         data[dataIndex]['Contact Person'] = result.contactPerson;
         data[dataIndex]['Business Phone'] = result.businessPhone;
+        data[dataIndex]['Selskapsform'] = result.selskapsform;
+        data[dataIndex]['Antall Ansatte'] = result.antallAnsatte;
       }
       
       if (result.contactPerson !== 'Not found') {
@@ -823,6 +988,8 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       console.error(`  ❌ Error processing ${businessName}: ${error.message}`);
       business['Contact Person'] = 'Not found';
       business['Business Phone'] = 'Not found';
+      business['Selskapsform'] = 'Not found';
+      business['Antall Ansatte'] = 'Not found';
       updatedCount++;
       notFoundCount++;
     }
@@ -844,9 +1011,81 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     await browser.close();
   }
   
+  // ============================================
+  // QUALITY FILTERING - Remove low-quality leads
+  // ============================================
+  console.log('\n' + '='.repeat(60));
+  console.log('🔍 APPLYING QUALITY FILTERS');
+  console.log('='.repeat(60));
+  
+  const beforeFilterCount = data.length;
+  let filteredOutENK = 0;
+  let filteredOutPhone = 0;
+  
+  // Filter 1: Remove ENK (Enkeltpersonforetak) only - all other company types are OK
+  console.log('\n📋 Filter 1: Checking Selskapsform (company type)...');
+  console.log('   Rule: Remove ONLY Enkeltpersonforetak (ENK) - all other types are accepted');
+  const afterENKFilter = data.filter(business => {
+    const selskapsform = (business['Selskapsform'] || '').toUpperCase().trim();
+    
+    // Check for ENK variations (Enkeltpersonforetak)
+    const isENK = selskapsform === 'ENK' || 
+                  selskapsform.includes('ENKELTPERSON') || 
+                  selskapsform.includes('ENKELTMANNS') ||
+                  selskapsform.includes('ENKELTFORETAK');
+    
+    if (isENK) {
+      console.log(`  ❌ Removing "${business.Name || business.name}" - Selskapsform: ${business['Selskapsform']} (Enkeltpersonforetak)`);
+      filteredOutENK++;
+      return false;
+    }
+    
+    // Keep all other company types (AS, ANS, DA, NUF, SA, ASA, Stiftelse, etc.)
+    return true;
+  });
+  
+  console.log(`  ✅ Kept ${afterENKFilter.length} businesses (removed ${filteredOutENK} Enkeltpersonforetak)`);
+  
+  // Filter 2: Remove businesses with no phone numbers
+  console.log('\n📋 Filter 2: Checking phone availability...');
+  const afterPhoneFilter = afterENKFilter.filter(business => {
+    const googlePhone = (business['Phone'] || '').trim();
+    const businessPhone = (business['Business Phone'] || '').trim();
+    
+    // Check if at least one phone is valid (not empty and not "Not found")
+    const hasGooglePhone = googlePhone && googlePhone !== 'Not found' && googlePhone.length >= 8;
+    const hasBusinessPhone = businessPhone && businessPhone !== 'Not found' && businessPhone.length >= 8;
+    
+    if (hasGooglePhone || hasBusinessPhone) {
+      // Add a helper column to indicate phone status
+      business['Has Valid Phone'] = true;
+      return true;
+    }
+    
+    console.log(`  ❌ Removing "${business.Name || business.name}" - No valid phone numbers found`);
+    business['Has Valid Phone'] = false;
+    filteredOutPhone++;
+    return false;
+  });
+  
+  console.log(`  ✅ Kept ${afterPhoneFilter.length} businesses (removed ${filteredOutPhone} with no phones)`);
+  
+  // Update data array with filtered results
+  const filteredData = afterPhoneFilter;
+  const totalFiltered = beforeFilterCount - filteredData.length;
+  
+  console.log('\n' + '-'.repeat(60));
+  console.log(`📊 FILTERING SUMMARY:`);
+  console.log(`   Before filtering: ${beforeFilterCount} businesses`);
+  console.log(`   After filtering: ${filteredData.length} businesses`);
+  console.log(`   Removed (Enkeltpersonforetak): ${filteredOutENK}`);
+  console.log(`   Removed (no phone): ${filteredOutPhone}`);
+  console.log(`   Total removed: ${totalFiltered}`);
+  console.log('='.repeat(60) + '\n');
+  
   // Write updated data back to Excel
-  console.log('\n💾 Writing updated data to Excel file...');
-  const newWorksheet = xlsx.utils.json_to_sheet(data);
+  console.log('\n💾 Writing FILTERED data to Excel file...');
+  const newWorksheet = xlsx.utils.json_to_sheet(filteredData);
   const newWorkbook = xlsx.utils.book_new();
   xlsx.utils.book_append_sheet(newWorkbook, newWorksheet, workbook.SheetNames[0]);
   
@@ -884,17 +1123,23 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   
   // Summary
   console.log('\n' + '='.repeat(60));
-  console.log('📊 EXPANSION SUMMARY');
+  console.log('📊 EXPANSION & FILTERING SUMMARY');
   console.log('='.repeat(60));
   if (TEST_LIMIT) {
-    console.log(`🧪 TESTING MODE: Processed ${businessesToProcess.length} of ${data.length} businesses`);
+    console.log(`🧪 TESTING MODE: Processed ${businessesToProcess.length} of ${beforeFilterCount} businesses`);
   } else {
-    console.log(`Total businesses: ${data.length}`);
+    console.log(`Total businesses processed: ${beforeFilterCount}`);
   }
-  console.log(`Updated: ${updatedCount}`);
-  console.log(`Contact persons found: ${foundCount}`);
-  console.log(`Not found: ${notFoundCount}`);
-  console.log(`Skipped (already had contact person): ${skippedCount}`);
+  console.log(`Proff.no enrichment:`);
+  console.log(`  - Updated: ${updatedCount}`);
+  console.log(`  - Contact persons found: ${foundCount}`);
+  console.log(`  - Not found: ${notFoundCount}`);
+  console.log(`  - Skipped: ${skippedCount}`);
+  console.log(`Quality filtering:`);
+  console.log(`  - Removed (Enkeltpersonforetak): ${filteredOutENK}`);
+  console.log(`  - Removed (no phone numbers): ${filteredOutPhone}`);
+  console.log(`  - Total removed: ${totalFiltered}`);
+  console.log(`\n✅ FINAL QUALITY LEADS: ${filteredData.length}`);
   console.log('='.repeat(60) + '\n');
 }
 
