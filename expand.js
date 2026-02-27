@@ -20,320 +20,251 @@ const MANUAL_SELECTORS = {
   businessPhone: 'a.addax.addax-cs_ip_phone_click'  // Found from debug: This is the clickable phone link
 };
 
-// Function to scrape Proff.no for contact person/owner name
-async function scrapeProffContactPerson(businessName, page) {
+// --- Normalization and matching (for two-step Proff search) ---
+/** Normalize address for matching: strip building-name prefix, expand street abbreviations, lowercase, collapse space. */
+function normalizeAddress(s) {
+  if (!s || typeof s !== 'string') return '';
+  let t = s.trim();
+  // Strip leading "BUILDINGNAME, " only when the part before the first comma has no digits (likely building/area name)
+  if (t.includes(',')) {
+    const firstSegment = t.split(',')[0].trim();
+    if (!/\d/.test(firstSegment)) {
+      t = t.replace(/^[^,]+\s*,\s*/, '');
+    }
+  }
+  t = t
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[,.]/g, '');
+  // Collapse digit + single letter so "25 a" matches "25a"
+  t = t.replace(/\b(\d+)\s+([a-zæøå])\b/g, '$1$2');
+  // Norwegian street abbreviations -> "gate" so "gt" matches "gate"
+  t = t.replace(/\bgt\b/g, 'gate');
+  t = t.replace(/\bgata\b/g, 'gate');
+  t = t.replace(/\bvegen\b/g, 'veg');
+  t = t.replace(/\bvei\b/g, 'veg');
+  t = t.replace(/\bveg\b/g, 'veg');
+  t = t.replace(/\b(\d{4})\s*([A-Za-zÆØÅæøå]+)?/g, '$1 $2').trim();
+  return t;
+}
+
+function normalizeName(s) {
+  if (!s || typeof s !== 'string') return '';
+  return s
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[,.]/g, '');
+}
+
+/** Strip special characters from business name for search queries (Proff, Google). Removes / \\ and similar to avoid broken URLs and noisy queries. */
+function cleanBusinessNameForSearch(name) {
+  if (!name || typeof name !== 'string') return '';
+  return name
+    .replace(/[/\\|*?"<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Address match: normalize both and compare. Also true if one contains the other (handles extra tokens). */
+function addressesMatch(addr1, addr2) {
+  const a = normalizeAddress(addr1);
+  const b = normalizeAddress(addr2);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+  return false;
+}
+
+/** Clean address for Google/search: same normalization so query matches how Proff.no lists addresses. */
+function addressForSearch(rawAddress) {
+  return normalizeAddress(rawAddress);
+}
+
+/** Name similarity for step 2: one contains the other, or high word overlap (same business, different wording). */
+function namesSimilar(name1, name2) {
+  const a = normalizeName(name1);
+  const b = normalizeName(name2);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+  const wordsA = new Set(a.split(/\s+/).filter(w => w.length > 1));
+  const wordsB = new Set(b.split(/\s+/).filter(w => w.length > 1));
+  const intersection = [...wordsA].filter(w => wordsB.has(w));
+  const unionSize = new Set([...wordsA, ...wordsB]).size;
+  if (unionSize === 0) return false;
+  const ratio = intersection.length / Math.min(wordsA.size, wordsB.size);
+  return ratio >= 0.6;
+}
+
+/** Score 0–1 for how similar name is to the business name (for picking best among same-address results). Not strict. */
+function nameSimilarityScore(businessName, title) {
+  const a = normalizeName(businessName);
+  const b = normalizeName(title);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.85;
+  const wordsA = new Set(a.split(/\s+/).filter(w => w.length > 1));
+  const wordsB = new Set(b.split(/\s+/).filter(w => w.length > 1));
+  const intersection = [...wordsA].filter(w => wordsB.has(w));
+  const ratio = intersection.length / Math.min(wordsA.size, wordsB.size) || 0;
+  return ratio;
+}
+
+/** Detect Proff category/search result (e.g. "golf i bedrifter - 2694 treff", "golfklubb - 324 selskaper") - not a single business. */
+function isCategoryResult(title) {
+  if (!title || typeof title !== 'string') return true;
+  const t = title.trim();
+  if (/i bedrifter\s*[-–]\s*\d+\s*treff/i.test(t)) return true;
+  if (/\d+\s*treff\s*\|\s*Side\s+\d+\s+av\s+\d+/i.test(t)) return true;
+  if (/\d+\s*selskaper\s+i Norge/i.test(t)) return true;
+  if (/-\s*\d+\s*selskaper/i.test(t)) return true;
+  if (/Side\s+\d+\s+av\s+\d+/.test(t)) return true;
+  return false;
+}
+
+/** Dismiss Proff.no consent/cookie banner if present (handles multiple CMP frameworks + iframes). Fast waits for Step 1. */
+async function handleProffConsent(page) {
   try {
-    // Use DuckDuckGo - supports site: operator properly and low bot blocking
-    const searchQuery = `${businessName} site:proff.no`;
-    const encodedQuery = encodeURIComponent(searchQuery);
-    const searchUrl = `https://duckduckgo.com/?q=${encodedQuery}`;
-    
-    console.log(`  🔍 DuckDuckGo: ${businessName} site:proff.no`);
-    
-    // Navigate to DuckDuckGo search
-    try {
-      await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-    } catch (e) {
-      // If timeout, try with shorter timeout
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // 1. Try common button selectors on the main page
+    const consentSelectors = [
+      'button[aria-label*="Godta"]',
+      'button[aria-label*="Accept"]',
+      '#onetrust-accept-btn-handler',
+      'button[id*="accept"]',
+      'button[class*="accept"]',
+      'button[class*="consent"]',
+      'button[title="ENIG"]',
+      'button[title="Enig"]',
+    ];
+    for (const selector of consentSelectors) {
       try {
-        await page.goto(searchUrl, { waitUntil: 'load', timeout: 15000 });
-      } catch (e2) {
-        console.log(`  ⚠️  Search timeout, continuing anyway...`);
-      }
+        const btn = await page.$(selector);
+        if (btn) {
+          await btn.click();
+          await new Promise(resolve => setTimeout(resolve, 150));
+          return;
+        }
+      } catch (e) {}
     }
-    
-    // Wait for search results to load (DuckDuckGo uses JavaScript rendering)
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    // Find and click the first Proff.no result
-    let proffUrl = null;
-    try {
-      // Find the first result that links to proff.no
-      proffUrl = await page.evaluate(() => {
-        // DuckDuckGo result selectors
-        const resultSelectors = [
-          'a[href*="proff.no/selskap"]',
-          'a[href*="proff.no/bedrift"]',
-          'a[href*="proff.no/firma"]',
-          'article a[href*="proff.no"]',
-          '[data-testid="result"] a[href*="proff.no"]',
-          '.result__a[href*="proff.no"]',
-          'a.result__url[href*="proff.no"]'
-        ];
-        
-        for (const selector of resultSelectors) {
-          const links = document.querySelectorAll(selector);
-          for (const link of links) {
-            const href = link.href || link.getAttribute('href');
-            if (href && href.includes('proff.no') && 
-                (href.includes('/selskap/') || href.includes('/bedrift/') || href.includes('/firma/'))) {
-              return href;
-            }
+
+    // 2. Text-based search: find any button containing "ENIG", "Godta", "Aksepter", "Accept" on main page
+    const clicked = await page.evaluate(() => {
+      const targets = ['ENIG', 'Enig', 'Godta alle', 'Godta', 'Aksepter', 'Accept all', 'Accept'];
+      const buttons = [...document.querySelectorAll('button, [role="button"], a.btn, a[class*="button"]')];
+      for (const target of targets) {
+        for (const btn of buttons) {
+          const text = (btn.textContent || '').trim();
+          if (text === target || text.toUpperCase() === target.toUpperCase()) {
+            btn.click();
+            return true;
           }
-        }
-        
-        // Fallback: get any proff.no link from results
-        const allLinks = document.querySelectorAll('a[href*="proff.no"]');
-        for (const link of allLinks) {
-          const href = link.href || link.getAttribute('href');
-          // Skip DuckDuckGo's redirect wrapper if present
-          if (href && href.includes('proff.no') && !href.includes('duckduckgo.com')) {
-            return href;
-          }
-        }
-        
-        return null;
-      });
-      
-      // Handle DuckDuckGo redirect URLs (they sometimes wrap links)
-      if (proffUrl && proffUrl.includes('uddg=')) {
-        const match = proffUrl.match(/uddg=([^&]+)/);
-        if (match) {
-          proffUrl = decodeURIComponent(match[1]);
         }
       }
-      
-      if (proffUrl) {
-        
-        console.log(`  🔗 Found Proff.no link: ${proffUrl}`);
-        // Navigate directly to the Proff.no page
-        try {
-          await page.goto(proffUrl, { waitUntil: 'networkidle2', timeout: 20000 });
-        } catch (e) {
-          // If timeout, try with shorter timeout
-          try {
-            await page.goto(proffUrl, { waitUntil: 'load', timeout: 10000 });
-          } catch (e2) {
-            console.log(`  ⚠️  Proff.no page timeout, continuing anyway...`);
-          }
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      } else {
-        console.log(`  ⚠️  No Proff.no result found in search`);
-        return { contactPerson: 'Not found', businessPhone: 'Not found' };
-      }
-    } catch (e) {
-      console.log(`  ❌ Error finding Proff.no link: ${e.message}`);
-      return { contactPerson: 'Not found', businessPhone: 'Not found' };
+      return false;
+    });
+    if (clicked) {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      return;
     }
-    
-    // Handle Proff.no consent if it appears
-    try {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const consentSelectors = [
-        'button[aria-label*="Godta"]',
-        'button[aria-label*="Accept"]',
-        'button:contains("Godta alle")',
-        'button:contains("Accept all")',
-        '#onetrust-accept-btn-handler',
-        'button[id*="accept"]',
-        'button[class*="accept"]'
-      ];
-      
-      for (const selector of consentSelectors) {
-        try {
-          const consentButton = await page.$(selector);
-          if (consentButton) {
-            console.log(`  🔘 Clicking Proff.no consent button...`);
-            await consentButton.click();
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            break;
-          }
-        } catch (e) {
-          // Continue to next selector
-        }
-      }
-    } catch (e) {
-      // No consent popup
-    }
-    
-    // DEBUG MODE: Inspect HTML structure to find actual selectors
-    if (DEBUG_MODE) {
-      console.log(`\n  🔍 DEBUG MODE: Inspecting HTML structure for "${businessName}"...`);
-      
-      const htmlInspection = await page.evaluate(() => {
-        const inspection = {
-          pageTitle: document.title,
-          pageUrl: window.location.href,
-          contactPersonElements: [],
-          phoneElements: [],
-          allTextContent: document.body.innerText.substring(0, 2000) // First 2000 chars
-        };
-        
-        // Find all elements that might contain contact person info
-        const possibleContactSelectors = [
-          '*[class*="contact"]',
-          '*[class*="kontakt"]',
-          '*[class*="leder"]',
-          '*[class*="leader"]',
-          '*[class*="person"]',
-          '*[id*="contact"]',
-          '*[id*="kontakt"]',
-          '*[data-testid*="contact"]',
-          '*[data-testid*="person"]'
-        ];
-        
-        possibleContactSelectors.forEach(selector => {
-          try {
-            const elements = document.querySelectorAll(selector);
-            elements.forEach((el, idx) => {
-              if (idx < 5) { // Limit to first 5 of each type
-                const text = el.textContent?.trim();
-                const className = el.className || '';
-                const id = el.id || '';
-                if (text && text.length > 0 && text.length < 200) {
-                  inspection.contactPersonElements.push({
-                    selector: selector,
-                    className: className,
-                    id: id,
-                    text: text.substring(0, 100),
-                    tagName: el.tagName,
-                    parentClass: el.parentElement?.className || '',
-                    parentId: el.parentElement?.id || ''
-                  });
-                }
-              }
-            });
-          } catch (e) {}
-        });
-        
-        // Find all elements that might contain phone info
-        const possiblePhoneSelectors = [
-          'a[href^="tel:"]',
-          'a[href*="tel:"]',
-          '*[class*="phone"]',
-          '*[class*="telefon"]',
-          '*[id*="phone"]',
-          '*[id*="telefon"]',
-          '*[data-phone]',
-          '*[data-telefon]',
-          'button[aria-label*="Ring"]',
-          'button[aria-label*="Call"]'
-        ];
-        
-        possiblePhoneSelectors.forEach(selector => {
-          try {
-            const elements = document.querySelectorAll(selector);
-            elements.forEach((el, idx) => {
-              if (idx < 5) {
-                const text = el.textContent?.trim();
-                const href = el.getAttribute('href') || '';
-                const className = el.className || '';
-                const id = el.id || '';
-                const dataPhone = el.getAttribute('data-phone') || el.getAttribute('data-telefon') || '';
-                
-                inspection.phoneElements.push({
-                  selector: selector,
-                  className: className,
-                  id: id,
-                  href: href,
-                  dataPhone: dataPhone,
-                  text: text ? text.substring(0, 100) : '',
-                  tagName: el.tagName,
-                  parentClass: el.parentElement?.className || '',
-                  parentId: el.parentElement?.id || ''
-                });
-              }
-            });
-          } catch (e) {}
-        });
-        
-        // Also search for text patterns that might indicate structure
-        const bodyHTML = document.body.innerHTML;
-        const contactPatterns = [
-          /Daglig\s+leder[^<]*<[^>]*>([^<]+)/i,
-          /Kontaktperson[^<]*<[^>]*>([^<]+)/i,
-          /Daily\s+leader[^<]*<[^>]*>([^<]+)/i
-        ];
-        
-        contactPatterns.forEach(pattern => {
-          const match = bodyHTML.match(pattern);
-          if (match) {
-            inspection.contactPersonElements.push({
-              selector: 'PATTERN_MATCH',
-              pattern: pattern.toString(),
-              matchedText: match[1].substring(0, 100),
-              context: match[0].substring(0, 200)
-            });
-          }
-        });
-        
-        return inspection;
-      });
-      
-      // Save inspection to file for analysis
-      const fs = require('fs');
-      const inspectionFile = `debug_inspection_${businessName.replace(/[^a-z0-9]/gi, '_')}_${Date.now()}.json`;
-      fs.writeFileSync(inspectionFile, JSON.stringify(htmlInspection, null, 2));
-      console.log(`  💾 Saved HTML inspection to: ${inspectionFile}`);
-      
-      // Also log key findings to console
-      console.log(`  📋 Found ${htmlInspection.contactPersonElements.length} potential contact person elements`);
-      console.log(`  📋 Found ${htmlInspection.phoneElements.length} potential phone elements`);
-      
-      if (htmlInspection.contactPersonElements.length > 0) {
-        console.log(`  🔍 Sample contact person elements:`);
-        htmlInspection.contactPersonElements.slice(0, 3).forEach((el, idx) => {
-          console.log(`    ${idx + 1}. Class: "${el.className}", Text: "${el.text}"`);
-        });
-      }
-      
-      if (htmlInspection.phoneElements.length > 0) {
-        console.log(`  🔍 Sample phone elements:`);
-        htmlInspection.phoneElements.slice(0, 3).forEach((el, idx) => {
-          console.log(`    ${idx + 1}. Class: "${el.className}", Href: "${el.href}", Text: "${el.text}"`);
-        });
-      }
-      
-      // Take screenshot for visual inspection
-      const screenshotPath = `debug_screenshot_${businessName.replace(/[^a-z0-9]/gi, '_')}_${Date.now()}.png`;
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.log(`  📸 Saved screenshot to: ${screenshotPath}`);
-    }
-    
-    // Simple extraction: Find name next to leadership roles
-    const extractedData = await page.evaluate(() => {
-      const bodyText = document.body.innerText || '';
-      
-      // Priority order: Daglig leder > Styrets leder > Styreleder > Administrerende direktør > CEO > Kontaktperson
-      const roles = [
-        'Daglig leder',
-        'Styrets leder',  // Chairman of the board (found on S'wich page)
-        'Styreleder', 
-        'Administrerende direktør',
-        'CEO',
-        'Kontaktperson'
-      ];
-      
-      let contactPerson = null;
-      
-      // Method 1: Search in DOM elements (more reliable for structured data)
-      for (const role of roles) {
-        // Find all elements containing the role text
-        const allElements = document.querySelectorAll('*');
-        for (const element of allElements) {
-          const elementText = element.textContent || '';
-          if (elementText.includes(role)) {
-            // Check if name is in same element
-            const roleIndex = elementText.indexOf(role);
-            const afterRole = elementText.substring(roleIndex + role.length).trim();
-            
-            // Try same line match (role: name or role name)
-            const sameLineMatch = afterRole.match(/^[:\s]*([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)+)/);
-            if (sameLineMatch && sameLineMatch[1]) {
-              let name = sameLineMatch[1].trim();
-              const adresseIndex = name.toLowerCase().indexOf('adresse');
-              if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
-              if (name.length > 2 && name.length < 100) {
-                contactPerson = name;
-                break;
+
+    // 3. Check inside iframes (many CMP frameworks use iframes for the consent dialog)
+    const frames = page.frames();
+    for (const frame of frames) {
+      try {
+        const frameClicked = await frame.evaluate(() => {
+          const targets = ['ENIG', 'Enig', 'Godta alle', 'Godta', 'Aksepter', 'Accept all', 'Accept'];
+          const buttons = [...document.querySelectorAll('button, [role="button"], a.btn, a[class*="button"]')];
+          for (const target of targets) {
+            for (const btn of buttons) {
+              const text = (btn.textContent || '').trim();
+              if (text === target || text.toUpperCase() === target.toUpperCase()) {
+                btn.click();
+                return true;
               }
             }
-            
-            // Check next sibling element
-            let nextSibling = element.nextElementSibling;
-            if (nextSibling) {
-              let name = (nextSibling.textContent || '').trim();
+          }
+          return false;
+        });
+        if (frameClicked) {
+          await new Promise(resolve => setTimeout(resolve, 150));
+          return;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+/** Extract company name, address, contact person, phone, selskapsform, antall ansatte from current Proff page. */
+async function extractAllFromProffPage(page) {
+  const extracted = await page.evaluate(() => {
+    const bodyText = document.body.innerText || '';
+
+    // --- Company name (for matching) ---
+    let proffCompanyName = '';
+    const h1 = document.querySelector('h1');
+    if (h1) proffCompanyName = h1.textContent.trim();
+    if (!proffCompanyName) proffCompanyName = (document.title || '').split('|')[0].split('-')[0].trim();
+
+    // --- Address (for matching) ---
+    let proffAddress = '';
+    const adresseLabels = ['Adresse', 'Besøksadresse', 'Postadresse'];
+    for (const label of adresseLabels) {
+      const idx = bodyText.indexOf(label);
+      if (idx !== -1) {
+        const after = bodyText.substring(idx + label.length, idx + label.length + 120);
+        const line = after.split('\n')[0].trim();
+        const cleaned = line.replace(/^\s*[:\-]\s*/, '').trim();
+        if (cleaned.length > 5 && /\d{4}/.test(cleaned)) {
+          proffAddress = cleaned;
+          break;
+        }
+      }
+    }
+    if (!proffAddress) {
+      const addrMatch = bodyText.match(/(?:Adresse|Besøksadresse)[:\s]*([^\n]{10,80}\d{4}\s*[A-Za-zÆØÅæøå]+)/);
+      if (addrMatch) proffAddress = addrMatch[1].trim();
+    }
+
+    // --- Contact person and phone (existing logic) ---
+    const roles = ['Daglig leder', 'Styrets leder', 'Styreleder', 'Administrerende direktør', 'CEO', 'Kontaktperson'];
+    let contactPerson = null;
+    for (const role of roles) {
+      const allElements = document.querySelectorAll('*');
+      for (const element of allElements) {
+        const elementText = element.textContent || '';
+        if (elementText.includes(role)) {
+          const roleIndex = elementText.indexOf(role);
+          const afterRole = elementText.substring(roleIndex + role.length).trim();
+          const sameLineMatch = afterRole.match(/^[:\s]*([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)+)/);
+          if (sameLineMatch && sameLineMatch[1]) {
+            let name = sameLineMatch[1].trim();
+            const adresseIndex = name.toLowerCase().indexOf('adresse');
+            if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
+            if (name.length > 2 && name.length < 100) {
+              contactPerson = name;
+              break;
+            }
+          }
+          let nextSibling = element.nextElementSibling;
+          if (nextSibling) {
+            let name = (nextSibling.textContent || '').trim();
+            const adresseIndex = name.toLowerCase().indexOf('adresse');
+            if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
+            if (name.length > 2 && name.length < 100 && /[A-ZÆØÅa-zæøå]/.test(name) && !name.match(/^\d+$/) && !name.toLowerCase().includes(role.toLowerCase())) {
+              contactPerson = name;
+              break;
+            }
+          }
+          if (element.parentElement) {
+            const children = Array.from(element.parentElement.children);
+            const ri = children.indexOf(element);
+            if (ri !== -1 && ri < children.length - 1) {
+              const nextChild = children[ri + 1];
+              let name = (nextChild.textContent || '').trim();
               const adresseIndex = name.toLowerCase().indexOf('adresse');
               if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
               if (name.length > 2 && name.length < 100 && /[A-ZÆØÅa-zæøå]/.test(name) && !name.match(/^\d+$/) && !name.toLowerCase().includes(role.toLowerCase())) {
@@ -341,285 +272,437 @@ async function scrapeProffContactPerson(businessName, page) {
                 break;
               }
             }
-            
-            // Check parent's next child
-            if (element.parentElement) {
-              const children = Array.from(element.parentElement.children);
-              const roleIndex = children.indexOf(element);
-              if (roleIndex !== -1 && roleIndex < children.length - 1) {
-                const nextChild = children[roleIndex + 1];
-                let name = (nextChild.textContent || '').trim();
-                const adresseIndex = name.toLowerCase().indexOf('adresse');
-                if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
-                if (name.length > 2 && name.length < 100 && /[A-ZÆØÅa-zæøå]/.test(name) && !name.match(/^\d+$/) && !name.toLowerCase().includes(role.toLowerCase())) {
-                  contactPerson = name;
-                  break;
-                }
-              }
-            }
           }
         }
         if (contactPerson) break;
       }
-      
-      // Method 2: Fallback to text-based search
-      if (!contactPerson) {
-        for (const role of roles) {
-          const roleIndex = bodyText.indexOf(role);
-          if (roleIndex !== -1) {
-            const afterRole = bodyText.substring(roleIndex + role.length, roleIndex + role.length + 200);
-            
-            // Try same line
-            const sameLineMatch = afterRole.match(/^[:\s]*([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)+)/);
-            if (sameLineMatch && sameLineMatch[1]) {
-              let name = sameLineMatch[1].trim();
-              const adresseIndex = name.toLowerCase().indexOf('adresse');
-              if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
-              if (name.length > 2 && name.length < 100) {
-                contactPerson = name;
-                break;
-              }
+      if (contactPerson) break;
+    }
+    if (!contactPerson) {
+      for (const role of roles) {
+        const roleIndex = bodyText.indexOf(role);
+        if (roleIndex !== -1) {
+          const afterRole = bodyText.substring(roleIndex + role.length, roleIndex + role.length + 200);
+          const sameLineMatch = afterRole.match(/^[:\s]*([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)+)/);
+          if (sameLineMatch && sameLineMatch[1]) {
+            let name = sameLineMatch[1].trim();
+            const adresseIndex = name.toLowerCase().indexOf('adresse');
+            if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
+            if (name.length > 2 && name.length < 100) {
+              contactPerson = name;
+              break;
             }
-            
-            // Try next lines
-            const lines = afterRole.split(/\n/).filter(line => line.trim().length > 0);
-            for (let i = 0; i < Math.min(lines.length, 3); i++) {
-              let name = lines[i].trim();
-              if (name.toLowerCase().includes(role.toLowerCase())) continue;
-              const adresseIndex = name.toLowerCase().indexOf('adresse');
-              if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
-              if (name.length > 2 && name.length < 100 && /[A-ZÆØÅa-zæøå]/.test(name) && !name.match(/^\d+$/)) {
-                contactPerson = name;
-                break;
-              }
-            }
-            if (contactPerson) break;
           }
+          const lines = afterRole.split(/\n/).filter(l => l.trim().length > 0);
+          for (let i = 0; i < Math.min(lines.length, 3); i++) {
+            let name = lines[i].trim();
+            if (name.toLowerCase().includes(role.toLowerCase())) continue;
+            const adresseIndex = name.toLowerCase().indexOf('adresse');
+            if (adresseIndex !== -1) name = name.substring(0, adresseIndex).trim();
+            if (name.length > 2 && name.length < 100 && /[A-ZÆØÅa-zæøå]/.test(name) && !name.match(/^\d+$/)) {
+              contactPerson = name;
+              break;
+            }
+          }
+          if (contactPerson) break;
         }
       }
-      
-      // Find phone: Look for clickable phone link first
-      let businessPhone = null;
-      
-      // Try all tel: links (there might be multiple)
-      const phoneLinks = document.querySelectorAll('a[href^="tel:"]');
-      for (const phoneLink of phoneLinks) {
-        const href = phoneLink.getAttribute('href');
-        if (href) {
-          const phone = href.replace('tel:', '').trim();
-          // Prefer Norwegian format (8 digits)
-          if (phone.length >= 8) {
-            businessPhone = phone;
+    }
+
+    let businessPhone = null;
+    const phoneLinks = document.querySelectorAll('a[href^="tel:"]');
+    for (const phoneLink of phoneLinks) {
+      const href = phoneLink.getAttribute('href');
+      if (href) {
+        const phone = href.replace('tel:', '').trim();
+        if (phone.length >= 8) {
+          businessPhone = phone;
+          break;
+        }
+      }
+    }
+    if (!businessPhone) {
+      const telefonIndex = bodyText.indexOf('Telefon');
+      if (telefonIndex !== -1) {
+        const afterTelefon = bodyText.substring(telefonIndex + 7, telefonIndex + 30);
+        const phoneMatch = afterTelefon.match(/(\+47\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{8})/);
+        if (phoneMatch) businessPhone = phoneMatch[1].replace(/\s+/g, '').trim();
+      }
+    }
+    if (!businessPhone) {
+      const phoneMatch = bodyText.match(/(\+47\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{8})/);
+      if (phoneMatch) businessPhone = phoneMatch[1].replace(/\s+/g, '').trim();
+    }
+
+    let selskapsform = null;
+    let antallAnsatte = null;
+    const companyTypeLabels = ['Selskapsform', 'Organisasjonsform', 'Foretaksform'];
+    for (const label of companyTypeLabels) {
+      const labelIndex = bodyText.indexOf(label);
+      if (labelIndex !== -1) {
+        const afterLabel = bodyText.substring(labelIndex + label.length, labelIndex + label.length + 100);
+        const companyTypes = [
+          { pattern: 'enkeltpersonforetak', short: 'ENK' }, { pattern: 'aksjeselskap', short: 'AS' },
+          { pattern: 'ansvarlig selskap', short: 'ANS' }, { pattern: 'delt ansvar', short: 'DA' },
+          { pattern: 'norskregistrert utenlandsk foretak', short: 'NUF' }, { pattern: 'samvirkeforetak', short: 'SA' },
+          { pattern: 'allmennaksjeselskap', short: 'ASA' }, { pattern: 'stiftelse', short: 'Stiftelse' }
+        ];
+        for (const type of companyTypes) {
+          if (afterLabel.toLowerCase().includes(type.pattern)) {
+            selskapsform = type.short;
             break;
           }
         }
-      }
-      
-      // Fallback: search for phone pattern in text (look for "Telefon" label)
-      if (!businessPhone) {
-        const telefonIndex = bodyText.indexOf('Telefon');
-        if (telefonIndex !== -1) {
-          const afterTelefon = bodyText.substring(telefonIndex + 7, telefonIndex + 30);
-          const phoneMatch = afterTelefon.match(/(\+47\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{8})/);
-          if (phoneMatch) {
-            businessPhone = phoneMatch[1].replace(/\s+/g, '').trim();
-          }
+        if (!selskapsform) {
+          const rawMatch = afterLabel.match(/^\s*:?\s*([A-ZÆØÅa-zæøå\s]+)/);
+          if (rawMatch && rawMatch[1].trim().length > 1) selskapsform = rawMatch[1].trim();
         }
+        if (selskapsform) break;
       }
-      
-      // Final fallback: search entire page for phone pattern
-      if (!businessPhone) {
-        const phoneMatch = bodyText.match(/(\+47\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|\d{8})/);
-        if (phoneMatch) {
-          businessPhone = phoneMatch[1].replace(/\s+/g, '').trim();
-        }
-      }
-      
-      // Extract Selskapsform (company type) and Antall ansatte (employee count)
-      // Using specific Proff.no HTML selectors
-      let selskapsform = null;
-      let antallAnsatte = null;
-      
-      // Method 1: Use specific Proff.no selectors (OfficialCompanyInformationCard)
-      try {
-        // Find all property containers in the official company info card
-        const propertyContainers = document.querySelectorAll('.OfficialCompanyInformationCard-propertyList, [class*="OfficialCompanyInformationCard"]');
-        
-        propertyContainers.forEach(container => {
-          const text = container.textContent || '';
-          
-          // Look for Selskapsform
-          if (text.toLowerCase().includes('selskapsform') || text.toLowerCase().includes('organisasjonsform')) {
-            // Find the property value element
-            const valueElements = container.querySelectorAll('.OfficialCompanyInformationCard-propertyValue, [class*="propertyValue"]');
-            valueElements.forEach(valueEl => {
-              const value = valueEl.textContent?.trim();
-              if (value && !selskapsform) {
-                selskapsform = value;
-              }
-            });
-          }
-          
-          // Look for Antall ansatte (employee count)
-          if (text.toLowerCase().includes('antall ansatte') || text.toLowerCase().includes('ansatte')) {
-            const valueElements = container.querySelectorAll('.OfficialCompanyInformationCard-propertyValue, [class*="propertyValue"]');
-            valueElements.forEach(valueEl => {
-              const value = valueEl.textContent?.trim();
-              // Extract number from text like "5" or "5-10" or "10+"
-              const numMatch = value?.match(/(\d+)/);
-              if (numMatch && !antallAnsatte) {
-                antallAnsatte = value;
-              }
-            });
-          }
-        });
-        
-        // Also try MuiGrid containers
-        const muiGridContainers = document.querySelectorAll('.MuiGrid-root.MuiGrid-grid-xs-12.MuiGrid-grid-md-6');
-        muiGridContainers.forEach(container => {
-          const text = container.textContent || '';
-          
-          if (text.toLowerCase().includes('selskapsform') && !selskapsform) {
-            const valueEl = container.querySelector('.OfficialCompanyInformationCard-propertyValue');
-            if (valueEl) {
-              selskapsform = valueEl.textContent?.trim();
-            }
-          }
-          
-          if (text.toLowerCase().includes('antall ansatte') && !antallAnsatte) {
-            const valueEl = container.querySelector('.OfficialCompanyInformationCard-propertyValue');
-            if (valueEl) {
-              antallAnsatte = valueEl.textContent?.trim();
-            }
-          }
-        });
-      } catch (e) {
-        // Continue to fallback methods
-      }
-      
-      // Method 2: Fallback - text-based search
-      if (!selskapsform) {
-        const companyTypeLabels = ['Selskapsform', 'Organisasjonsform', 'Foretaksform'];
-        
-        for (const label of companyTypeLabels) {
-          const labelIndex = bodyText.indexOf(label);
-          if (labelIndex !== -1) {
-            const afterLabel = bodyText.substring(labelIndex + label.length, labelIndex + label.length + 100);
-            
-            // Common Norwegian company types
-            const companyTypes = [
-              { pattern: 'enkeltpersonforetak', short: 'ENK' },
-              { pattern: 'aksjeselskap', short: 'AS' },
-              { pattern: 'ansvarlig selskap', short: 'ANS' },
-              { pattern: 'delt ansvar', short: 'DA' },
-              { pattern: 'norskregistrert utenlandsk foretak', short: 'NUF' },
-              { pattern: 'samvirkeforetak', short: 'SA' },
-              { pattern: 'allmennaksjeselskap', short: 'ASA' },
-              { pattern: 'stiftelse', short: 'Stiftelse' }
-            ];
-            
-            for (const type of companyTypes) {
-              if (afterLabel.toLowerCase().includes(type.pattern)) {
-                selskapsform = type.short;
+    }
+    if (!selskapsform) {
+      const asMatch = bodyText.match(/\b(ENK|AS|ANS|DA|NUF|SA|ASA)\b/);
+      if (asMatch) selskapsform = asMatch[1];
+    }
+    const ansatteIndex = bodyText.indexOf('Antall ansatte');
+    if (ansatteIndex !== -1) {
+      const afterAnsatte = bodyText.substring(ansatteIndex + 14, ansatteIndex + 50);
+      const numMatch = afterAnsatte.match(/(\d+[-–]?\d*\+?)/);
+      if (numMatch) antallAnsatte = numMatch[1];
+    }
+
+    return {
+      proffCompanyName: proffCompanyName || '',
+      proffAddress: proffAddress || '',
+      contactPerson: contactPerson,
+      businessPhone: businessPhone,
+      selskapsform: selskapsform,
+      antallAnsatte: antallAnsatte
+    };
+  });
+  return extracted;
+}
+
+// Function to scrape Proff.no for contact person/owner name (two-step: Proff direct, then Google)
+const STEP2_MAX_SERP_RESULTS = 15;
+const STEP1_NAV_TIMEOUT = 5000;
+const STEP1_CANDIDATE_TIMEOUT = 5000;
+
+/** Step 1: Search Proff.no by business name across all result pages; match by address visible on listing; open ONLY the matching profile (never open every result). */
+async function step1ProffDirectSearch(businessName, address, page) {
+  const searchName = cleanBusinessNameForSearch(businessName) || businessName;
+  console.log(`  🔍 Proff.no direct: "${searchName}"`);
+  try {
+    const currentUrl = page.url();
+    if (!currentUrl.includes('proff.no')) {
+      await page.goto('https://www.proff.no', { waitUntil: 'domcontentloaded', timeout: STEP1_NAV_TIMEOUT });
+      await handleProffConsent(page);
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+
+    const normalizedSearchAddress = normalizeAddress(address);
+    const allCandidates = [];
+    let pageNum = 1;
+    let hasNextPage = true;
+
+    while (hasNextPage) {
+      const searchUrl = pageNum === 1
+        ? `https://www.proff.no/s%C3%B8k-etter-firmanavn?q=${encodeURIComponent(searchName)}`
+        : `https://www.proff.no/s%C3%B8k-etter-firmanavn?q=${encodeURIComponent(searchName)}&side=${pageNum}`;
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: STEP1_NAV_TIMEOUT });
+      await handleProffConsent(page);
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const pageResult = await page.evaluate((currentPage) => {
+        const out = [];
+        const seen = new Set();
+        const links = document.querySelectorAll('a[href*="/selskap/"], a[href*="/bedrift/"], a[href*="/firma/"]');
+        for (const a of links) {
+          let href = a.href || a.getAttribute('href');
+          if (!href || href.includes('sok') || href.includes('s%C3%B8k') || href.includes('bransje')) continue;
+          try {
+            const u = new URL(href, 'https://www.proff.no');
+            const pathParts = u.pathname.split('/').filter(Boolean);
+            if (pathParts.length < 2 || seen.has(u.pathname)) continue;
+            seen.add(u.pathname);
+            let snippet = '';
+            // Walk up to find the result card that contains both link and address (postcode in text)
+            let el = a.parentElement;
+            while (el && el !== document.body) {
+              const text = (el.innerText || el.textContent || '').trim();
+              if (text.length >= 50 && /\d{4}\s*[A-Za-zÆØÅæøå]+/.test(text)) {
+                snippet = text;
                 break;
               }
+              el = el.parentElement;
             }
-            
-            // If still not found, try to extract the raw value
-            if (!selskapsform) {
-              const rawMatch = afterLabel.match(/^\s*:?\s*([A-ZÆØÅa-zæøå\s]+)/);
-              if (rawMatch && rawMatch[1].trim().length > 1) {
-                selskapsform = rawMatch[1].trim();
+            if (!snippet) {
+              const row = a.closest('article') || a.closest('[data-testid]') || a.closest('div[class]') || a.parentElement;
+              if (row) snippet = (row.innerText || row.textContent || '').trim();
+            }
+            if (!snippet) snippet = (a.innerText || a.textContent || '').trim();
+            out.push({ href: u.href, snippet });
+          } catch (e) {}
+        }
+        const nextPage = currentPage + 1;
+        const nextLinks = document.querySelectorAll(`a[href*="side=${nextPage}"]`);
+        const hasNext = nextLinks.length > 0;
+        return { candidates: out, hasNext };
+      }, pageNum);
+
+      hasNextPage = pageResult.hasNext && pageResult.candidates.length > 0;
+
+      pageResult.candidates.forEach(c => allCandidates.push(c));
+
+      if (pageResult.candidates.length > 0 && pageResult.hasNext) {
+        console.log(`  📄 Step 1: page ${pageNum} → ${pageResult.candidates.length} candidates (${allCandidates.length} total), more pages`);
+      }
+
+      // If we got 0 candidates we might be on a single-result redirect (profile page)
+      if (pageResult.candidates.length === 0) {
+        const url = page.url();
+        if (/proff\.no\/(selskap|bedrift|firma)\/[^/]+\//.test(url)) {
+          console.log('  📋 Step 1: Single result (redirect to profile), extracting');
+          const data = await extractAllFromProffPage(page);
+          if (data && data.proffAddress && addressesMatch(address, data.proffAddress)) {
+            console.log(`  📍 Address match: "${data.proffAddress}"`);
+            return { ...data, tier: 1 };
+          }
+        }
+        break;
+      }
+
+      const matchOnListing = allCandidates.find(c => normalizedSearchAddress && addressesMatch(address, c.snippet));
+      if (matchOnListing) {
+        console.log(`  📋 Step 1: Address match on listing (page ${pageNum}), opening 1 profile only`);
+        await page.goto(matchOnListing.href, { waitUntil: 'domcontentloaded', timeout: STEP1_CANDIDATE_TIMEOUT });
+        await handleProffConsent(page);
+        await new Promise(resolve => setTimeout(resolve, 150));
+        const data = await extractAllFromProffPage(page);
+        if (data && data.proffAddress && addressesMatch(address, data.proffAddress)) {
+          console.log(`  📍 Address match: "${data.proffAddress}"`);
+          return { ...data, tier: 1 };
+        }
+      }
+
+      if (!hasNextPage) break;
+      pageNum++;
+      console.log(`  📄 Step 1: loading result page ${pageNum}...`);
+    }
+
+    // Never open every candidate – only open when we matched on listing. If no listing match, return null (Step 2 will run).
+    if (allCandidates.length > 0) {
+      console.log(`  📋 Step 1: ${allCandidates.length} candidate(s) on ${pageNum} page(s), no address on listing – skip (no profile opened)`);
+    }
+  } catch (e) {
+    console.log(`  ⚠️  Step 1 error: ${e.message}`);
+  }
+  return null;
+}
+
+/** Step 2: Google search for Proff.no fallback. Tier 2 = "name" "address" proff.no (quoted), take only result with correct address in snippet. Tier 3 = "name" proff.no (no address in query so address can appear in results). */
+async function step2GoogleSearch(businessName, address, page) {
+  if (!address || !String(address).trim()) {
+    console.log('  ⚠️  Step 2 requires address; skipping.');
+    return null;
+  }
+  const normalizedSearchAddress = normalizeAddress(address);
+  if (!normalizedSearchAddress) return null;
+
+  const STEP2_NAV_TIMEOUT = 22000;
+  const runGoogleSearch = async (query) => {
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=no`;
+    let navOk = false;
+    try {
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: STEP2_NAV_TIMEOUT });
+      navOk = true;
+    } catch (navErr) {
+      const url = page.url();
+      if (url.includes('consent.google') || url.includes('accounts.google')) {
+        try {
+          await page.evaluate(() => {
+            const targets = ['Godta alle', 'Accept all', 'Jeg godtar', 'I agree'];
+            const buttons = [...document.querySelectorAll('button')];
+            for (const target of targets) {
+              for (const btn of buttons) {
+                if ((btn.textContent || '').trim() === target) { btn.click(); return; }
               }
             }
-            
-            if (selskapsform) break;
+            const byId = document.querySelector('#L2AGLb') || document.querySelector('#W0wltc');
+            if (byId) byId.click();
+          });
+          await new Promise(resolve => setTimeout(resolve, 4000));
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          navOk = true;
+        } catch (e) {}
+      } else if (url.includes('google.com/search')) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        navOk = true;
+      }
+      if (!navOk) {
+        try {
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          navOk = true;
+        } catch (retryErr) {}
+      }
+      if (!navOk) throw navErr;
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const landedUrl = page.url();
+    if (landedUrl.includes('consent.google') || landedUrl.includes('accounts.google')) {
+      try {
+        await page.evaluate(() => {
+          const targets = ['Godta alle', 'Accept all', 'Jeg godtar', 'I agree'];
+          const buttons = [...document.querySelectorAll('button')];
+          for (const target of targets) {
+            for (const btn of buttons) {
+              if ((btn.textContent || '').trim() === target) { btn.click(); return; }
+            }
           }
+          const byId = document.querySelector('#L2AGLb') || document.querySelector('#W0wltc');
+          if (byId) byId.click();
+        });
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        if (page.url().includes('consent.google') || page.url().includes('accounts.google')) {
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
+      } catch (e) {}
+    }
+    return page.evaluate((maxResults) => {
+      const out = [];
+      const links = document.querySelectorAll('a[href*="proff.no"]');
+      const seen = new Set();
+      for (const a of links) {
+        const href = a.href || a.getAttribute('href');
+        if (!href || href.includes('google.com') || href.includes('webcache') || href.includes('translate')) continue;
+        if (href.includes('proff.no/sok') || href.includes('proff.no/s%C3%B8k') || href.includes('proff.no/bransje') || href.includes('proff.no/søk')) continue;
+        try {
+          const u = new URL(href);
+          const pathParts = u.pathname.split('/').filter(Boolean);
+          if (pathParts.length < 2) continue;
+        } catch (e) { continue; }
+        if (seen.has(href)) continue;
+        seen.add(href);
+        const title = (a.textContent || '').trim();
+        let blockText = '';
+        const parent = a.closest('div.g') || a.closest('div[data-hveid]') || a.closest('div');
+        if (parent) blockText = (parent.innerText || parent.textContent || '').trim();
+        else blockText = title;
+        out.push({ href, title, blockText });
+        if (out.length >= maxResults) break;
       }
-      
-      // Method 3: Last resort - look for abbreviations
-      if (!selskapsform) {
-        const asMatch = bodyText.match(/\b(ENK|AS|ANS|DA|NUF|SA|ASA)\b/);
-        if (asMatch) {
-          selskapsform = asMatch[1];
-        }
+      return out;
+    }, STEP2_MAX_SERP_RESULTS);
+  };
+
+  try {
+    // --- Tier 2: name "address" proff.no (quotes only on address) → only take result with address in snippet ---
+    const tier2Query = `${cleanBusinessNameForSearch(businessName) || businessName} "${address}" proff.no`;
+    console.log(`  🔍 Google (Tier 2): ${tier2Query}`);
+    try {
+      const tier2Results = await runGoogleSearch(tier2Query);
+      const tier2Viable = tier2Results.filter(r => !isCategoryResult(r.title));
+      const tier2WithAddress = tier2Viable.filter(r =>
+        normalizedSearchAddress && addressesMatch(address, r.blockText)
+      );
+      if (tier2WithAddress.length > 0) {
+        tier2WithAddress.sort((a, b) => nameSimilarityScore(businessName, b.title) - nameSimilarityScore(businessName, a.title));
+        const best = tier2WithAddress[0];
+        console.log(`  📍 SERP match (address in snippet) → Tier 2: "${(best.title || '').slice(0, 50)}..."`);
+        const data = await openProffUrlAndExtract(best.href, page);
+        if (data) return { ...data, tier: 2 };
       }
-      
-      // Extract antall ansatte from text if not found via selectors
-      if (!antallAnsatte) {
-        const ansatteIndex = bodyText.indexOf('Antall ansatte');
-        if (ansatteIndex !== -1) {
-          const afterAnsatte = bodyText.substring(ansatteIndex + 14, ansatteIndex + 50);
-          const numMatch = afterAnsatte.match(/(\d+[-–]?\d*\+?)/);
-          if (numMatch) {
-            antallAnsatte = numMatch[1];
-          }
-        }
+      console.log(`  📋 Tier 2: ${tier2Viable.length} proff.no results, ${tier2WithAddress.length} with address in snippet`);
+    } catch (tier2Err) {
+      console.log(`  ⚠️  Tier 2 failed (${tier2Err.message}), trying Tier 3...`);
+    }
+
+    // --- Tier 3: name proff.no (no address) → take top viable link (always run if Tier 2 didn't return) ---
+    const tier3Query = `${cleanBusinessNameForSearch(businessName) || businessName} proff.no`;
+    console.log(`  🔍 Google (Tier 3): ${tier3Query}`);
+    try {
+      const tier3Results = await runGoogleSearch(tier3Query);
+      const tier3Viable = tier3Results.filter(r => !isCategoryResult(r.title));
+      if (tier3Viable.length > 0) {
+        const first = tier3Viable[0];
+        console.log(`  📌 Tier 3 (first viable): "${(first.title || '').slice(0, 50)}..."`);
+        const data = await openProffUrlAndExtract(first.href, page);
+        if (data) return { ...data, tier: 3 };
+      } else {
+        console.log('  ⚠️  Step 2: No Tier 2 or Tier 3 Proff result found');
       }
-      
-      return {
-        contactPerson: contactPerson,
-        businessPhone: businessPhone,
-        selskapsform: selskapsform,
-        antallAnsatte: antallAnsatte
-      };
-    });
-    
-    // Clean contact person name - remove "Adresse" if still present
-    let cleanedContactPerson = extractedData.contactPerson;
-    if (cleanedContactPerson) {
-      const adresseIndex = cleanedContactPerson.toLowerCase().indexOf('adresse');
-      if (adresseIndex !== -1) {
-        cleanedContactPerson = cleanedContactPerson.substring(0, adresseIndex).trim();
+    } catch (tier3Err) {
+      console.log(`  ⚠️  Step 2 error (Tier 3): ${tier3Err.message}`);
+    }
+  } catch (e) {
+    console.log(`  ⚠️  Step 2 error: ${e.message}`);
+  }
+  return null;
+}
+
+async function openProffUrlAndExtract(href, page) {
+  try {
+    await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await handleProffConsent(page);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const data = await extractAllFromProffPage(page);
+    if (data) console.log(`  ✅ Got data from: ${data.proffCompanyName || '(page)'}`);
+    return data || null;
+  } catch (e) {
+    console.log(`  ⚠️  Error opening Proff URL: ${e.message}`);
+    return null;
+  }
+}
+
+async function scrapeProffContactPerson(businessName, address, page) {
+  try {
+    const excelAddress = (address && address !== 'Not found' && String(address).trim()) ? String(address).trim() : '';
+
+    // Step 1: Proff.no direct search by name, match by address (top 10 results)
+    if (excelAddress) {
+      const result1 = await step1ProffDirectSearch(businessName, excelAddress, page);
+      if (result1) {
+        console.log('  ✅ Matched via Step 1 (Proff direct) → Tier 1');
+        return formatProffResult(result1);
       }
-      // Remove any role labels that might be at the start
-      cleanedContactPerson = cleanedContactPerson.replace(/^(Daglig leder|Styrets leder|Styreleder|Administrerende direktør|CEO|Kontaktperson)[:\s]*/i, '').trim();
     }
-    
-    // Return contact person, business phone, selskapsform, and employee count
-    const finalResult = {
-      contactPerson: cleanedContactPerson || 'Not found',
-      businessPhone: extractedData.businessPhone || 'Not found',
-      selskapsform: extractedData.selskapsform || 'Not found',
-      antallAnsatte: extractedData.antallAnsatte || 'Not found'
-    };
-    
-    if (cleanedContactPerson) {
-      console.log(`  ✅ Found contact person: ${cleanedContactPerson}`);
-    } else {
-      console.log(`  ⚠️  No contact person found on Proff.no page`);
+
+    // Step 2: Google search "address site:proff.no" only; parse SERP, pick result with address in snippet + name in title
+    if (excelAddress) {
+      const result2 = await step2GoogleSearch(businessName, excelAddress, page);
+      if (result2) {
+        console.log(`  ✅ Matched via Step 2 (Google SERP) → Tier ${result2.tier}`);
+        return formatProffResult(result2);
+      }
     }
-    
-    if (extractedData.businessPhone) {
-      console.log(`  📞 Found business phone: ${extractedData.businessPhone}`);
-    } else {
-      console.log(`  ⚠️  No business phone found on Proff.no page`);
-    }
-    
-    if (extractedData.selskapsform) {
-      console.log(`  🏢 Found selskapsform: ${extractedData.selskapsform}`);
-    } else {
-      console.log(`  ⚠️  No selskapsform found on Proff.no page`);
-    }
-    
-    if (extractedData.antallAnsatte) {
-      console.log(`  👥 Found antall ansatte: ${extractedData.antallAnsatte}`);
-    } else {
-      console.log(`  ⚠️  No employee count found on Proff.no page`);
-    }
-    
-    return finalResult;
-    
+
+    console.log('  ⚠️  No matching Proff.no profile found');
+    return { contactPerson: 'Not found', businessPhone: 'Not found', selskapsform: 'Not found', antallAnsatte: 'Not found', tier: '' };
   } catch (error) {
     console.log(`  ❌ Error scraping Proff.no: ${error.message}`);
     return {
       contactPerson: 'Not found',
       businessPhone: 'Not found',
       selskapsform: 'Not found',
-      antallAnsatte: 'Not found'
+      antallAnsatte: 'Not found',
+      tier: ''
     };
   }
+}
+
+function formatProffResult(data) {
+  let contactPerson = (data.contactPerson || '').trim();
+  const adresseIndex = contactPerson.toLowerCase().indexOf('adresse');
+  if (adresseIndex !== -1) contactPerson = contactPerson.substring(0, adresseIndex).trim();
+  contactPerson = contactPerson.replace(/^(Daglig leder|Styrets leder|Styreleder|Administrerende direktør|CEO|Kontaktperson)[:\s]*/i, '').trim();
+  return {
+    contactPerson: contactPerson || 'Not found',
+    businessPhone: data.businessPhone || 'Not found',
+    selskapsform: data.selskapsform || 'Not found',
+    antallAnsatte: data.antallAnsatte || 'Not found',
+    tier: data.tier != null ? data.tier : ''
+  };
 }
 
 // Function to find the most recent Excel file
@@ -716,14 +799,23 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       }
     });
   }
+
+  const hasTierColumn = data.length > 0 && 'Tier' in data[0];
+  if (!hasTierColumn) {
+    console.log('📝 Adding "Tier" column to data...');
+    data.forEach(row => {
+      if (row['Tier'] == null) row['Tier'] = '';
+    });
+  }
   
-  // Browser launch function (reusable for restarts)
-  const BROWSER_RESTART_INTERVAL = 100; // Restart browser every 100 businesses to prevent memory issues
+  // Browser launch function
+  const BROWSER_RESTART_INTERVAL = 50; // Restart browser every 100 businesses to prevent memory issues
   
   async function launchBrowser() {
     console.log('🌐 Launching browser...');
     const newBrowser = await puppeteer.launch({ 
       headless: false,
+      protocolTimeout: 180000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -906,97 +998,142 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   }
   
   // START_FROM_INDEX: Set to skip already processed businesses (0 = start from beginning)
-  const START_FROM_INDEX = 376; // Change this to resume from a specific point
+  const START_FROM_INDEX = 0; // Change this to resume from a specific point
   
   if (START_FROM_INDEX > 0) {
     console.log(`⏭️  Skipping first ${START_FROM_INDEX} businesses, starting at #${START_FROM_INDEX + 1}\n`);
     skippedCount = START_FROM_INDEX;
   }
   
-  // Process each business
+  // ========== HORIZONTAL: Phase 1 = all Tier 1 (Proff only), Phase 2 = Tier 2/3 (Google only) ==========
+  console.log('\n' + '='.repeat(60));
+  console.log('📌 PHASE 1: Tier 1 only (Proff.no)');
+  console.log('='.repeat(60) + '\n');
+
   for (const [index, business] of businessesToProcess.entries()) {
-    // Skip to start index
-    if (index < START_FROM_INDEX) {
-      continue;
-    }
-    
-    // Check if we should stop
-    if (shouldStop) {
-      console.log('\n⚠️  Stopping processing...');
-      break;
-    }
+    if (index < START_FROM_INDEX) continue;
+    if (shouldStop) break;
     const businessName = business.Name || business.name || 'Unknown';
-    
-    console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 Processing: ${businessName}`);
-    
+    const excelAddress = (business.Address || business.address || '') !== 'Not found' ? String(business.Address || business.address || '').trim() : '';
+    console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 Phase 1 (Proff): ${businessName}`);
     try {
-      const result = await scrapeProffContactPerson(businessName, page);
-      
-      // Update the business object (which is a reference to data array when TEST_LIMIT is null)
-      business['Contact Person'] = result.contactPerson;
-      business['Business Phone'] = result.businessPhone;
-      business['Selskapsform'] = result.selskapsform;
-      business['Antall Ansatte'] = result.antallAnsatte;
-      
-      // Also update directly in data array to ensure it's saved (in case of reference issues)
-      const dataIndex = data.findIndex(b => (b.Name || b.name) === businessName);
-      if (dataIndex !== -1) {
-        data[dataIndex]['Contact Person'] = result.contactPerson;
-        data[dataIndex]['Business Phone'] = result.businessPhone;
-        data[dataIndex]['Selskapsform'] = result.selskapsform;
-        data[dataIndex]['Antall Ansatte'] = result.antallAnsatte;
-      }
-      
-      if (result.contactPerson !== 'Not found') {
+      const result1 = excelAddress ? await step1ProffDirectSearch(businessName, excelAddress, page) : null;
+      if (result1) {
+        const result = formatProffResult(result1);
+        business['Contact Person'] = result.contactPerson;
+        business['Business Phone'] = result.businessPhone;
+        business['Selskapsform'] = result.selskapsform;
+        business['Antall Ansatte'] = result.antallAnsatte;
+        business['Tier'] = result.tier != null ? result.tier : '';
+        const dataIndex = data.findIndex(b => (b.Name || b.name) === businessName);
+        if (dataIndex !== -1) {
+          data[dataIndex]['Contact Person'] = result.contactPerson;
+          data[dataIndex]['Business Phone'] = result.businessPhone;
+          data[dataIndex]['Selskapsform'] = result.selskapsform;
+          data[dataIndex]['Antall Ansatte'] = result.antallAnsatte;
+          data[dataIndex]['Tier'] = result.tier != null ? result.tier : '';
+        }
         foundCount++;
         updatedCount++;
+        console.log(`  ✅ Tier 1`);
       } else {
+        business['Contact Person'] = 'Not found';
+        business['Business Phone'] = 'Not found';
+        business['Selskapsform'] = 'Not found';
+        business['Antall Ansatte'] = 'Not found';
+        business['Tier'] = '';
+        const dataIndex = data.findIndex(b => (b.Name || b.name) === businessName);
+        if (dataIndex !== -1) {
+          data[dataIndex]['Contact Person'] = 'Not found';
+          data[dataIndex]['Business Phone'] = 'Not found';
+          data[dataIndex]['Selskapsform'] = 'Not found';
+          data[dataIndex]['Antall Ansatte'] = 'Not found';
+          data[dataIndex]['Tier'] = '';
+        }
         notFoundCount++;
         updatedCount++;
       }
-      
-      // CRITICAL: Save progress after EVERY business to prevent data loss
-      // This ensures we never lose more than 1 business worth of data
       await saveProgress();
-      
-      // Increment restart counter
       processedSinceRestart++;
-      
-      // Restart browser every 100 businesses to prevent memory issues
       if (processedSinceRestart >= BROWSER_RESTART_INTERVAL && index < businessesToProcess.length - 1 && !shouldStop) {
-        console.log(`\n🔄 Restarting browser after ${BROWSER_RESTART_INTERVAL} businesses to prevent memory issues...`);
-        try {
-          await browser.close();
-        } catch (e) {
-          console.log(`  ⚠️  Error closing browser: ${e.message}`);
-        }
+        console.log(`\n🔄 Restarting browser...`);
+        try { await browser.close(); } catch (e) {}
         const newSession = await launchBrowser();
         browser = newSession.browser;
         page = newSession.page;
         processedSinceRestart = 0;
-        console.log(`✅ Browser restarted successfully!\n`);
       }
-      
-      // Rate limiting: wait 2-3 seconds between requests
       if (index < businessesToProcess.length - 1 && !shouldStop) {
-        const delay = Math.random() * 1000 + 2000; // 2-3 seconds
-        console.log(`  ⏳ Waiting ${Math.round(delay)}ms before next request...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        const delay = result1 ? 300 + Math.random() * 150 : 150 + Math.random() * 100;
+        await new Promise(r => setTimeout(r, delay));
       }
-      
-    } catch (error) {
-      console.error(`  ❌ Error processing ${businessName}: ${error.message}`);
+    } catch (e) {
+      console.error(`  ❌ Phase 1: ${e.message}`);
+      if (e.name === 'ProtocolError' || (e.message && e.message.includes('timed out'))) {
+        console.log('  🔄 Restarting browser after protocol/timeout error...');
+        try {
+          await browser.close();
+        } catch (closeErr) {}
+        const newSession = await launchBrowser();
+        browser = newSession.browser;
+        page = newSession.page;
+        processedSinceRestart = 0;
+      }
       business['Contact Person'] = 'Not found';
       business['Business Phone'] = 'Not found';
       business['Selskapsform'] = 'Not found';
       business['Antall Ansatte'] = 'Not found';
+      business['Tier'] = '';
       updatedCount++;
       notFoundCount++;
     }
-    
-    // Check if we should stop after each business
-    if (shouldStop) {
-      break;
+  }
+
+  const phase2List = businessesToProcess.filter(b => (b['Tier'] !== 1 && b['Tier'] !== '1') && (b.Address || b.address));
+  console.log('\n' + '='.repeat(60));
+  console.log(`📌 PHASE 2: Tier 2/3 (Google) – ${phase2List.length} businesses`);
+  console.log('='.repeat(60) + '\n');
+
+  for (const [index, business] of businessesToProcess.entries()) {
+    if (shouldStop) break;
+    if (business['Tier'] === 1 || business['Tier'] === '1') continue;
+    const businessName = business.Name || business.name || 'Unknown';
+    const excelAddress = (business.Address || business.address || '') !== 'Not found' ? String(business.Address || business.address || '').trim() : '';
+    if (!excelAddress) continue;
+    console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 Phase 2 (Google): ${businessName}`);
+    try {
+      const result2 = await step2GoogleSearch(businessName, excelAddress, page);
+      if (result2) {
+        const result = formatProffResult(result2);
+        business['Contact Person'] = result.contactPerson;
+        business['Business Phone'] = result.businessPhone;
+        business['Selskapsform'] = result.selskapsform;
+        business['Antall Ansatte'] = result.antallAnsatte;
+        business['Tier'] = result.tier != null ? result.tier : '';
+        const dataIndex = data.findIndex(b => (b.Name || b.name) === businessName);
+        if (dataIndex !== -1) {
+          data[dataIndex]['Contact Person'] = result.contactPerson;
+          data[dataIndex]['Business Phone'] = result.businessPhone;
+          data[dataIndex]['Selskapsform'] = result.selskapsform;
+          data[dataIndex]['Antall Ansatte'] = result.antallAnsatte;
+          data[dataIndex]['Tier'] = result.tier != null ? result.tier : '';
+        }
+        foundCount++;
+        console.log(`  ✅ Tier ${result.tier}`);
+      }
+      await saveProgress();
+      processedSinceRestart++;
+      if (processedSinceRestart >= BROWSER_RESTART_INTERVAL && !shouldStop) {
+        console.log(`\n🔄 Restarting browser...`);
+        try { await browser.close(); } catch (e) {}
+        const newSession = await launchBrowser();
+        browser = newSession.browser;
+        page = newSession.page;
+        processedSinceRestart = 0;
+      }
+      await new Promise(r => setTimeout(r, Math.random() * 1000 + 2000));
+    } catch (e) {
+      console.error(`  ❌ Phase 2: ${e.message}`);
     }
   }
   

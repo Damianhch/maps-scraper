@@ -211,7 +211,7 @@ console.log('✅ Graceful shutdown handler installed - Press Ctrl+C at any time 
 // TESTING MODE: Set to number of businesses to process, or null/undefined to process all
 // Example: const TEST_LIMIT = 10;  // Process only first 10 businesses
 //          const TEST_LIMIT = null; // Process all businesses
-const TEST_LIMIT = 5; // Set to a number (e.g., 10) to limit processing, or null to process all
+const TEST_LIMIT = null; // Process all businesses (set to a number to limit for testing)
 
 // PROXY CONFIGURATION
 // Option 1: Use proxy list file (proxies.txt - one proxy per line, format: ip:port or ip:port:user:pass)
@@ -1705,6 +1705,7 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
       let rating = 'Not found';
       let hours = 'Not found';
       let priceLevel = 'Not found';
+      let reviewCount = 0;
       
       try {
         // Extract rating
@@ -1734,7 +1735,6 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
         }
         
         // Extract review count
-        let reviewCount = 0;
         try {
           reviewCount = await page.evaluate(() => {
             // Method 1: Look for aria-label with review count (most reliable)
@@ -1887,10 +1887,10 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
       console.log(`Hours: ${hours}`);
       console.log(`Price Level: ${priceLevel}`);
 
-      // QUALITY FILTER 1: Check review count (minimum 7 reviews required)
-      const MIN_REVIEW_COUNT = 7;
+      // QUALITY FILTER 1: Check review count (over 7 = 8+ reviews required)
+      const MIN_REVIEW_COUNT = 8; // Over 7 = 8+ reviews required
       if (reviewCount < MIN_REVIEW_COUNT) {
-        console.log(`❌ SKIPPING ${businessName} - Only ${reviewCount} reviews (minimum ${MIN_REVIEW_COUNT} required)`);
+        console.log(`❌ SKIPPING ${businessName} - Only ${reviewCount} reviews (need over 7, i.e. ${MIN_REVIEW_COUNT}+)`);
         console.log('---------------------------');
         continue; // Skip this business - not enough reviews
       }
@@ -2066,9 +2066,9 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
   if (TEST_LIMIT) {
     console.log(`🧪 TESTING MODE: Processed ${businessesToProcess.length} of ${results.length} businesses`);
   }
-  console.log(`Businesses KEPT (7+ reviews, no website): ${excelData.length}`);
+  console.log(`Businesses KEPT (8+ reviews, no website): ${excelData.length}`);
   console.log(`Businesses FILTERED OUT: ${businessesToProcess.length - excelData.length}`);
-  console.log(`  - Reasons: <7 reviews, has real website`);
+  console.log(`  - Reasons: ≤7 reviews, has real website`);
   console.log(`Time taken: ${industryDuration} seconds`);
   console.log('========================\n');
 
