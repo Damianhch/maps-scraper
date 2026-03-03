@@ -3,6 +3,208 @@ const xlsx = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 
+// Setup page with anti-detection (same as scraper)
+async function setupPageAntiDetection(page) {
+  // Set realistic viewport
+  await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+  
+  // Set modern user agent (Chrome 120)
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
+  // Set additional headers to appear more realistic
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9,no;q=0.8,nb;q=0.7',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Cache-Control': 'max-age=0'
+  });
+  
+  // Hide automation indicators
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+    });
+    
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+      parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+    );
+    
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en', 'no'],
+    });
+    
+    window.chrome = {
+      runtime: {},
+    };
+  });
+
+  // Set consent cookies (may fail on about:blank - navigate to Google first)
+  try {
+    await page.setCookie(
+      {
+        name: 'CONSENT',
+        value: 'YES+cb.20241219-17-0.en+FX+667',
+        domain: '.google.com',
+        path: '/',
+        expires: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60
+      },
+      {
+        name: 'CONSENT',
+        value: 'YES+cb.20241219-17-0.en+FX+667',
+        domain: '.google.no',
+        path: '/',
+        expires: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60
+      }
+    );
+  } catch (e) {
+    // Cookies may fail on about:blank - will be set after first navigation
+  }
+}
+
+// Handle Google consent - mirrors scraper.js handleConsent exactly (proven to work)
+async function handleGoogleConsentProper(page, url) {
+  console.log('  🍪 [handleConsent] Starting. Target: ' + url.substring(0, 70) + '...');
+  console.log('  📍 [handleConsent] Current URL: "' + page.url() + '"');
+  
+  // Exact same as scraper: networkidle2, catch timeout and continue (page IS loaded, just background reqs)
+  try {
+    console.log('  🔄 [handleConsent] goto (networkidle2, 30s)...');
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    console.log('  ✅ [handleConsent] Success. URL: "' + page.url() + '"');
+  } catch (e) {
+    // Timeout is EXPECTED on Google - page IS loaded, background requests keep running
+    console.log('  ⚠️ [handleConsent] Timeout (expected on Google) - continuing. URL: "' + page.url() + '"');
+  }
+  
+  // Wait for page to load
+  await new Promise(resolve => setTimeout(resolve, 4000));
+  
+  // Handle Google consent page if it appears
+  let currentUrl = page.url();
+  let consentAttempts = 0;
+  const maxConsentAttempts = 3;
+  
+  while ((currentUrl.includes('consent.google.com') || currentUrl.includes('/consent') || currentUrl.includes('consent')) && consentAttempts < maxConsentAttempts) {
+    console.log(`  🍪 Consent page detected (attempt ${consentAttempts + 1}/${maxConsentAttempts})`);
+    consentAttempts++;
+    
+    try {
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      // Try multiple methods to find and click accept button
+      const clicked = await page.evaluate(() => {
+        const allClickable = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"], a[role="button"]'));
+        const acceptButton = allClickable.find(btn => {
+          const text = (btn.textContent || btn.innerText || btn.getAttribute('aria-label') || btn.title || '').toLowerCase().trim();
+          return text === 'accept all' || 
+                 text === 'godta alle' ||
+                 text === 'accept' ||
+                 text === 'godta' ||
+                 text.includes('accept all') ||
+                 text.includes('godta alle') ||
+                 text.includes('i agree');
+        });
+        
+        if (acceptButton) {
+          acceptButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => acceptButton.click(), 100);
+          return true;
+        }
+        
+        const selectors = [
+          '#L2AGLb',
+          'button[data-ved]',
+          'button[id*="accept"]',
+          'button[class*="accept"]',
+          'form button[type="submit"]',
+          'button[jsname]',
+          '[data-ved][role="button"]'
+        ];
+        
+        for (const selector of selectors) {
+          const btn = document.querySelector(selector);
+          if (btn && btn.offsetParent !== null) {
+            btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            setTimeout(() => btn.click(), 100);
+            return true;
+          }
+        }
+        
+        return false;
+      });
+      
+      if (clicked) {
+        console.log('  ✅ Clicked accept button, waiting for redirect...');
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        
+        try {
+          await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }).catch(() => {});
+        } catch (e) {}
+      } else {
+        console.log('  ⚠️  Could not find accept button automatically');
+        const continueUrl = await page.evaluate(() => {
+          const continueLink = document.querySelector('a[href*="continue="]');
+          if (continueLink) {
+            const href = continueLink.getAttribute('href');
+            const match = href.match(/continue=([^&]+)/);
+            if (match) {
+              return decodeURIComponent(match[1]);
+            }
+          }
+          const urlParams = new URLSearchParams(window.location.search);
+          return urlParams.get('continue');
+        });
+        
+        if (continueUrl) {
+          console.log(`  🔄 Found continue URL, navigating directly...`);
+          await page.goto(continueUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+      }
+      
+      currentUrl = page.url();
+      
+      if (!currentUrl.includes('consent.google.com') && !currentUrl.includes('/consent') && !currentUrl.includes('consent')) {
+        console.log('  ✅ Successfully passed consent screen!');
+        break;
+      }
+    } catch (error) {
+      console.log(`  ⚠️  Error handling consent (attempt ${consentAttempts}): ${error.message}`);
+    }
+  }
+  
+  // Final check
+  currentUrl = page.url();
+  if (currentUrl.includes('consent.google.com') || currentUrl.includes('/consent') || currentUrl.includes('consent')) {
+    console.log('  ⚠️  Still on consent page, trying to extract continue URL...');
+    try {
+      const continueUrl = await page.evaluate(() => {
+        const urlParams = new URLSearchParams(window.location.search);
+        return urlParams.get('continue');
+      });
+      if (continueUrl) {
+        await page.goto(decodeURIComponent(continueUrl), { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    } catch (e) {
+      console.log('  ⚠️  Could not extract continue URL');
+    }
+  }
+}
+
 // TESTING MODE: Set to number of businesses to process, or null/undefined to process all
 // Example: const TEST_LIMIT = 5;  // Process only first 5 businesses
 //          const TEST_LIMIT = null; // Process all businesses
@@ -500,140 +702,122 @@ async function step1ProffDirectSearch(businessName, address, page) {
   return null;
 }
 
-/** Step 2: Google search for Proff.no fallback. Tier 2 = "name" "address" proff.no (quoted), take only result with correct address in snippet. Tier 3 = "name" proff.no (no address in query so address can appear in results). */
-async function step2GoogleSearch(businessName, address, page) {
-  if (!address || !String(address).trim()) {
-    console.log('  ⚠️  Step 2 requires address; skipping.');
-    return null;
-  }
-  const normalizedSearchAddress = normalizeAddress(address);
-  if (!normalizedSearchAddress) return null;
+/** Wait for Bing bot challenge to be solved by the user, if one appears.
+ *  Bing shows "Et siste trinn" / "Verifying..." CAPTCHA for automated browsers.
+ *  Pauses and waits up to 3 minutes for the user to solve it manually. */
+async function waitForBingChallenge(page) {
+  const isChallenge = await page.evaluate(() => {
+    const body = (document.body ? document.body.innerText : '').toLowerCase();
+    return body.includes('et siste trinn') || body.includes('one more step') ||
+           body.includes('verifying') || body.includes('captcha') ||
+           body.includes('løs utfordringen') || body.includes('solve the challenge');
+  }).catch(() => false);
 
-  const STEP2_NAV_TIMEOUT = 22000;
-  const runGoogleSearch = async (query) => {
-    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=no`;
-    let navOk = false;
+  if (!isChallenge) return; // No challenge, continue normally
+
+  console.log('\n  ⚠️  ⚠️  ⚠️  BING CHALLENGE DETECTED — PLEASE SOLVE THE PUZZLE IN THE BROWSER WINDOW  ⚠️  ⚠️  ⚠️');
+  console.log('  ⏳ Waiting up to 3 minutes for you to complete the verification...\n');
+
+  const maxWaitMs = 3 * 60 * 1000;
+  const pollMs = 2000;
+  const start = Date.now();
+
+  while (Date.now() - start < maxWaitMs) {
+    await new Promise(r => setTimeout(r, pollMs));
+    const stillChallenge = await page.evaluate(() => {
+      const body = (document.body ? document.body.innerText : '').toLowerCase();
+      return body.includes('et siste trinn') || body.includes('one more step') ||
+             body.includes('verifying') || body.includes('løs utfordringen') ||
+             body.includes('solve the challenge');
+    }).catch(() => false);
+    if (!stillChallenge) {
+      console.log('  ✅ Challenge solved! Continuing...\n');
+      await new Promise(r => setTimeout(r, 1500)); // Let results render
+      return;
+    }
+  }
+  console.log('  ❌ Challenge not solved within 3 minutes — skipping this business.\n');
+}
+
+/** Step 2: DuckDuckGo HTML search for proff.no company profile.
+ *  Uses html.duckduckgo.com/html/ — plain HTML, no JS, no redirects, no bot detection, Norwegian results. */
+async function step2BingSearch(businessName, address, page) {
+  if (!address || !String(address).trim()) return null;
+  if (!page) return null;
+  const normalizedSearchAddress = normalizeAddress(address);
+
+  const doSearch = async (query) => {
+    // DDG HTML endpoint: plain HTML page, direct links, Norwegian region (kl=no-no)
+    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=no-no`;
+    console.log(`  🔍 DDG: ${query.substring(0, 80)}...`);
     try {
-      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: STEP2_NAV_TIMEOUT });
-      navOk = true;
-    } catch (navErr) {
-      const url = page.url();
-      if (url.includes('consent.google') || url.includes('accounts.google')) {
-        try {
-          await page.evaluate(() => {
-            const targets = ['Godta alle', 'Accept all', 'Jeg godtar', 'I agree'];
-            const buttons = [...document.querySelectorAll('button')];
-            for (const target of targets) {
-              for (const btn of buttons) {
-                if ((btn.textContent || '').trim() === target) { btn.click(); return; }
-              }
-            }
-            const byId = document.querySelector('#L2AGLb') || document.querySelector('#W0wltc');
-            if (byId) byId.click();
-          });
-          await new Promise(resolve => setTimeout(resolve, 4000));
-          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-          navOk = true;
-        } catch (e) {}
-      } else if (url.includes('google.com/search')) {
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        navOk = true;
-      }
-      if (!navOk) {
-        try {
-          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-          navOk = true;
-        } catch (retryErr) {}
-      }
-      if (!navOk) throw navErr;
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    } catch (e) { /* page loads even on timeout */ }
+    await new Promise(r => setTimeout(r, 800));
+
+    const currentUrl = page.url();
+    if (!currentUrl.includes('duckduckgo.com')) {
+      console.log(`  ⚠️  Unexpected URL: ${currentUrl.substring(0, 60)}`);
+      return [];
     }
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    const landedUrl = page.url();
-    if (landedUrl.includes('consent.google') || landedUrl.includes('accounts.google')) {
-      try {
-        await page.evaluate(() => {
-          const targets = ['Godta alle', 'Accept all', 'Jeg godtar', 'I agree'];
-          const buttons = [...document.querySelectorAll('button')];
-          for (const target of targets) {
-            for (const btn of buttons) {
-              if ((btn.textContent || '').trim() === target) { btn.click(); return; }
-            }
-          }
-          const byId = document.querySelector('#L2AGLb') || document.querySelector('#W0wltc');
-          if (byId) byId.click();
-        });
-        await new Promise(resolve => setTimeout(resolve, 4000));
-        if (page.url().includes('consent.google') || page.url().includes('accounts.google')) {
-          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      } catch (e) {}
-    }
-    return page.evaluate((maxResults) => {
-      const out = [];
-      const links = document.querySelectorAll('a[href*="proff.no"]');
-      const seen = new Set();
-      for (const a of links) {
-        const href = a.href || a.getAttribute('href');
-        if (!href || href.includes('google.com') || href.includes('webcache') || href.includes('translate')) continue;
-        if (href.includes('proff.no/sok') || href.includes('proff.no/s%C3%B8k') || href.includes('proff.no/bransje') || href.includes('proff.no/søk')) continue;
+
+    // DDG HTML returns direct links (no redirect wrapping like Bing/Google)
+    const found = await page.evaluate((max) => {
+      const out = [], seen = new Set();
+      // Results are in <div class="result"> or <div class="web-result">
+      const items = Array.from(document.querySelectorAll('.result, .web-result, [data-testid="result"]'));
+      for (const item of items) {
+        // Main link: .result__a or .result__title a
+        const a = item.querySelector('a.result__a, .result__title a, h2 a, a[href*="proff.no"]');
+        if (!a) continue;
+        let href = a.href || a.getAttribute('href') || '';
+        if (!href.startsWith('http')) continue;
+        if (!href.includes('proff.no')) continue;
+        if (href.includes('/sok') || href.includes('/s%C3%B8k') || href.includes('/bransje')) continue;
         try {
-          const u = new URL(href);
-          const pathParts = u.pathname.split('/').filter(Boolean);
-          if (pathParts.length < 2) continue;
+          const parts = new URL(href).pathname.split('/').filter(Boolean);
+          if (parts.length < 2) continue;
+          if (!parts.some(p => ['selskap', 'bedrift', 'firma'].includes(p.toLowerCase()))) continue;
         } catch (e) { continue; }
-        if (seen.has(href)) continue;
-        seen.add(href);
+        if (seen.has(href)) continue; seen.add(href);
         const title = (a.textContent || '').trim();
-        let blockText = '';
-        const parent = a.closest('div.g') || a.closest('div[data-hveid]') || a.closest('div');
-        if (parent) blockText = (parent.innerText || parent.textContent || '').trim();
-        else blockText = title;
-        out.push({ href, title, blockText });
-        if (out.length >= maxResults) break;
+        const blockText = (item.innerText || item.textContent || '').trim();
+        if (title) { out.push({ href, title, blockText }); if (out.length >= max) break; }
       }
       return out;
-    }, STEP2_MAX_SERP_RESULTS);
+    }, STEP2_MAX_SERP_RESULTS).catch(() => []);
+
+    console.log(`  📊 ${found.length} proff.no company pages found`);
+    return found;
   };
 
   try {
-    // --- Tier 2: name "address" proff.no (quotes only on address) → only take result with address in snippet ---
-    const tier2Query = `${cleanBusinessNameForSearch(businessName) || businessName} "${address}" proff.no`;
-    console.log(`  🔍 Google (Tier 2): ${tier2Query}`);
-    try {
-      const tier2Results = await runGoogleSearch(tier2Query);
-      const tier2Viable = tier2Results.filter(r => !isCategoryResult(r.title));
-      const tier2WithAddress = tier2Viable.filter(r =>
-        normalizedSearchAddress && addressesMatch(address, r.blockText)
-      );
-      if (tier2WithAddress.length > 0) {
-        tier2WithAddress.sort((a, b) => nameSimilarityScore(businessName, b.title) - nameSimilarityScore(businessName, a.title));
-        const best = tier2WithAddress[0];
-        console.log(`  📍 SERP match (address in snippet) → Tier 2: "${(best.title || '').slice(0, 50)}..."`);
-        const data = await openProffUrlAndExtract(best.href, page);
-        if (data) return { ...data, tier: 2 };
-      }
-      console.log(`  📋 Tier 2: ${tier2Viable.length} proff.no results, ${tier2WithAddress.length} with address in snippet`);
-    } catch (tier2Err) {
-      console.log(`  ⚠️  Tier 2 failed (${tier2Err.message}), trying Tier 3...`);
+    // Tier 2: name + quoted address + site:proff.no → accept only if address in snippet
+    const q2 = `${cleanBusinessNameForSearch(businessName) || businessName} "${address}" site:proff.no`;
+    console.log(`  🔎 Tier 2: ${q2}`);
+    const r2 = await doSearch(q2);
+    const r2addr = r2.filter(r =>
+      !isCategoryResult(r.title) && normalizedSearchAddress && addressesMatch(address, r.blockText)
+    );
+    if (r2addr.length > 0) {
+      r2addr.sort((a, b) => nameSimilarityScore(businessName, b.title) - nameSimilarityScore(businessName, a.title));
+      console.log(`  📍 Tier 2 match: "${r2addr[0].title.slice(0, 60)}"`);
+      const d = await openProffUrlAndExtract(r2addr[0].href, page);
+      if (d) return { ...d, tier: 2 };
     }
+    console.log(`  📋 Tier 2: ${r2.length} results, ${r2addr.length} with matching address`);
 
-    // --- Tier 3: name proff.no (no address) → take top viable link (always run if Tier 2 didn't return) ---
-    const tier3Query = `${cleanBusinessNameForSearch(businessName) || businessName} proff.no`;
-    console.log(`  🔍 Google (Tier 3): ${tier3Query}`);
-    try {
-      const tier3Results = await runGoogleSearch(tier3Query);
-      const tier3Viable = tier3Results.filter(r => !isCategoryResult(r.title));
-      if (tier3Viable.length > 0) {
-        const first = tier3Viable[0];
-        console.log(`  📌 Tier 3 (first viable): "${(first.title || '').slice(0, 50)}..."`);
-        const data = await openProffUrlAndExtract(first.href, page);
-        if (data) return { ...data, tier: 3 };
-      } else {
-        console.log('  ⚠️  Step 2: No Tier 2 or Tier 3 Proff result found');
-      }
-    } catch (tier3Err) {
-      console.log(`  ⚠️  Step 2 error (Tier 3): ${tier3Err.message}`);
+    // Tier 3: name only + site:proff.no → first viable result
+    const q3 = `${cleanBusinessNameForSearch(businessName) || businessName} site:proff.no`;
+    console.log(`  🔎 Tier 3: ${q3}`);
+    const r3 = await doSearch(q3);
+    const r3v = r3.filter(r => !isCategoryResult(r.title));
+    if (r3v.length > 0) {
+      console.log(`  📌 Tier 3: "${r3v[0].title.slice(0, 60)}"`);
+      const d = await openProffUrlAndExtract(r3v[0].href, page);
+      if (d) return { ...d, tier: 3 };
+    } else {
+      console.log('  ⚠️  No proff.no results found for this business');
     }
   } catch (e) {
     console.log(`  ⚠️  Step 2 error: ${e.message}`);
@@ -643,14 +827,66 @@ async function step2GoogleSearch(businessName, address, page) {
 
 async function openProffUrlAndExtract(href, page) {
   try {
-    await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    // Validate URL before navigating
+    if (!href || !href.includes('proff.no')) {
+      console.log(`  ⚠️  Invalid Proff URL: ${href}`);
+      return null;
+    }
+    
+    // Navigate with retry logic
+    let navSuccess = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await page.goto(href, { waitUntil: 'networkidle', timeout: 20000 });
+        navSuccess = true;
+        break;
+      } catch (navErr) {
+        if (attempt === 0) {
+          // Try with domcontentloaded as fallback
+          try {
+            await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            navSuccess = true;
+            break;
+          } catch (e) {
+            console.log(`  ⚠️  Navigation attempt ${attempt + 1} failed: ${e.message}`);
+          }
+        } else {
+          throw navErr;
+        }
+      }
+    }
+    
+    if (!navSuccess) {
+      console.log(`  ⚠️  Failed to navigate to Proff URL: ${href}`);
+      return null;
+    }
+    
+    // Handle consent banner
     await handleProffConsent(page);
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Wait for page content to load
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    
+    // Verify we're on a proff.no page
+    const currentUrl = page.url();
+    if (!currentUrl.includes('proff.no')) {
+      console.log(`  ⚠️  Not on Proff page after navigation: ${currentUrl}`);
+      return null;
+    }
+    
+    // Extract data
     const data = await extractAllFromProffPage(page);
-    if (data) console.log(`  ✅ Got data from: ${data.proffCompanyName || '(page)'}`);
+    if (data) {
+      console.log(`  ✅ Got data from: ${data.proffCompanyName || '(page)'}`);
+    } else {
+      console.log(`  ⚠️  No data extracted from Proff page`);
+    }
     return data || null;
   } catch (e) {
-    console.log(`  ⚠️  Error opening Proff URL: ${e.message}`);
+    console.log(`  ⚠️  Error opening Proff URL (${href}): ${e.message}`);
+    if (e.stack) {
+      console.log(`  Stack: ${e.stack.split('\n').slice(0, 3).join('\n')}`);
+    }
     return null;
   }
 }
@@ -670,7 +906,7 @@ async function scrapeProffContactPerson(businessName, address, page) {
 
     // Step 2: Google search "address site:proff.no" only; parse SERP, pick result with address in snippet + name in title
     if (excelAddress) {
-      const result2 = await step2GoogleSearch(businessName, excelAddress, page);
+      const result2 = await step2BingSearch(businessName, excelAddress, page);
       if (result2) {
         console.log(`  ✅ Matched via Step 2 (Google SERP) → Tier ${result2.tier}`);
         return formatProffResult(result2);
@@ -813,9 +1049,11 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   
   async function launchBrowser() {
     console.log('🌐 Launching browser...');
+    // Match scraper.js createBrowser args - proven to work for Google
     const newBrowser = await puppeteer.launch({ 
       headless: false,
-      protocolTimeout: 180000,
+      protocolTimeout: 300000,
+      ignoreHTTPSErrors: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -825,7 +1063,9 @@ async function expandExcelWithContactPersons(excelFilename = null) {
         '--no-zygote',
         '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
-        '--disable-features=VizDisplayCompositor'
+        '--disable-features=VizDisplayCompositor',
+        '--disable-infobars',
+        '--window-size=1280,720'
       ]
     });
     
@@ -850,6 +1090,7 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   }
   
   let { browser, page } = await launchBrowser();
+
   let processedSinceRestart = 0; // Track businesses processed since last browser restart
   
   let updatedCount = 0;
@@ -954,7 +1195,7 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       }
     }
     
-    // Close browser
+    // Close browsers
     try {
       if (browser) {
         await browser.close();
@@ -1092,7 +1333,8 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   const phase2List = businessesToProcess.filter(b => (b['Tier'] !== 1 && b['Tier'] !== '1') && (b.Address || b.address));
   console.log('\n' + '='.repeat(60));
   console.log(`📌 PHASE 2: Tier 2/3 (Google) – ${phase2List.length} businesses`);
-  console.log('='.repeat(60) + '\n');
+  console.log('='.repeat(60));
+  console.log('ℹ️  Phase 2 uses the same browser/page as Phase 1 (no new tab).\n');
 
   for (const [index, business] of businessesToProcess.entries()) {
     if (shouldStop) break;
@@ -1102,7 +1344,7 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     if (!excelAddress) continue;
     console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 Phase 2 (Google): ${businessName}`);
     try {
-      const result2 = await step2GoogleSearch(businessName, excelAddress, page);
+      const result2 = await step2BingSearch(businessName, excelAddress, page);
       if (result2) {
         const result = formatProffResult(result2);
         business['Contact Person'] = result.contactPerson;
@@ -1123,8 +1365,8 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       }
       await saveProgress();
       processedSinceRestart++;
-      if (processedSinceRestart >= BROWSER_RESTART_INTERVAL && !shouldStop) {
-        console.log(`\n🔄 Restarting browser...`);
+      if (processedSinceRestart >= BROWSER_RESTART_INTERVAL && index < businessesToProcess.length - 1 && !shouldStop) {
+        console.log(`\n🔄 Restarting browser (Phase 2)...`);
         try { await browser.close(); } catch (e) {}
         const newSession = await launchBrowser();
         browser = newSession.browser;
