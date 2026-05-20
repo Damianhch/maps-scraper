@@ -1,7 +1,13 @@
 {
   "dependencies": {
+    "dotenv": "^16.6.1",
     "googleapis": "^164.1.0",
     "puppeteer": "^24.26.1",
     "xlsx": "^0.18.5"
+  },
+  "scripts": {
+    "scrape": "node scraper.js",
+    "scrape-and-expand": "node scraper.js && node expand.js",
+    "expand": "node expand.js"
   }
 }

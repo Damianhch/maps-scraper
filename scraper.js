@@ -7,7 +7,7 @@ const readline = require('readline'); // Import readline for user input
 // ============================================
 // PARALLEL BROWSER CONFIGURATION
 // ============================================
-const NUM_PARALLEL_BROWSERS = 1; // Number of browsers to run in parallel (set to 1 for testing)
+const NUM_PARALLEL_BROWSERS = 3; // Number of browsers to run in parallel (set to 1 for testing)
 
 // ============================================
 // GRACEFUL SHUTDOWN HANDLER
@@ -24,6 +24,75 @@ const gracefulShutdown = {
   totalIndustries: 0,
   browserStatus: [] // Track status of each browser worker
 };
+
+/** Dedupe and write scraper results so data survives even if expand never runs. */
+function saveScraperExcel(filename, statusLabel) {
+  if (gracefulShutdown.allResults.length === 0) return null;
+
+  const seenBusinesses = new Set();
+  const deduplicatedResults = gracefulShutdown.allResults.filter((business) => {
+    const key = `${business.Name}|${business.Address}`.toLowerCase();
+    if (seenBusinesses.has(key)) return false;
+    seenBusinesses.add(key);
+    return true;
+  });
+
+  const analysisData = [
+    { Metric: 'Status', Value: statusLabel },
+    {
+      Metric: 'Saved At',
+      Value: new Date().toISOString(),
+    },
+    {
+      Metric: 'Industries Processed',
+      Value: `${gracefulShutdown.industriesProcessed}/${gracefulShutdown.totalIndustries}`,
+    },
+    { Metric: 'Total Businesses', Value: deduplicatedResults.length },
+  ];
+
+  gracefulShutdown.timingData.forEach((timing) => {
+    if (!timing.industry) return;
+    analysisData.push({ Metric: `Industry: ${timing.industry}`, Value: '' });
+    if (timing.durationSeconds != null) {
+      analysisData.push({ Metric: '  - Duration (seconds)', Value: timing.durationSeconds });
+    }
+    if (timing.businessesKept != null) {
+      analysisData.push({ Metric: '  - Businesses Kept', Value: timing.businessesKept });
+    }
+    if (timing.error) {
+      analysisData.push({ Metric: '  - Error', Value: timing.error });
+    }
+  });
+
+  const workbook = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(workbook, xlsx.utils.json_to_sheet(deduplicatedResults), 'Results');
+  xlsx.utils.book_append_sheet(workbook, xlsx.utils.json_to_sheet(analysisData), 'scraper analyzing');
+
+  try {
+    xlsx.writeFile(workbook, filename);
+    return { filename, count: deduplicatedResults.length };
+  } catch (error) {
+    if (error.code === 'EBUSY') {
+      const alt = filename.replace('.xlsx', `_${Date.now()}.xlsx`);
+      xlsx.writeFile(workbook, alt);
+      return { filename: alt, count: deduplicatedResults.length };
+    }
+    throw error;
+  }
+}
+
+function saveCheckpointExcel() {
+  try {
+    const saved = saveScraperExcel('GoogleMapsResults_CHECKPOINT.xlsx', 'CHECKPOINT - scrape in progress');
+    if (saved) {
+      console.log(`💾 Checkpoint saved: ${saved.filename} (${saved.count} businesses)`);
+    }
+    return saved;
+  } catch (e) {
+    console.log(`⚠️  Checkpoint save failed: ${e.message}`);
+    return null;
+  }
+}
 
 // Function to save data during shutdown
 async function saveDataAndExit(reason = 'User requested shutdown') {
@@ -2225,6 +2294,7 @@ async function browserWorker(workerId, industries, proxies) {
         
         console.log(`${workerPrefix} ✅ Completed "${industry}": ${industryResult.data.length} businesses`);
         console.log(`${workerPrefix} 💾 Total in memory: ${gracefulShutdown.allResults.length} businesses`);
+        saveCheckpointExcel();
         
         // Delay between industries
         if (index < industries.length - 1 && !gracefulShutdown.isShuttingDown) {
