@@ -3,24 +3,75 @@ const fs = require('fs');
 const path = require('path');
 const { matchBusinessToBrreg } = require('./lib/match');
 const { loadEnv } = require('./lib/ai-match');
+const { FAST_MODE, EXPAND: EXPAND_PERF } = require('./lib/performance-config');
+const {
+  clearProgress,
+  reportExpandProgress,
+  markDone,
+  writeProgress,
+  PROGRESS_TXT,
+} = require('./lib/run-progress');
+const {
+  readScrapeOutputFromProgress,
+  readExpandOutputFromProgress,
+  getExpandOutputFile,
+} = require('./lib/session-output');
+const {
+  loadCombinedExistingLeadIndex,
+  discoverExclusionPaths,
+  filterNewLeads,
+} = require('./lib/existing-leads');
 
 loadEnv();
 
 const TEST_LIMIT = null;
 const START_FROM_INDEX = 0;
-const API_DELAY_MS = 300;
+const API_DELAY_MS = EXPAND_PERF.API_DELAY_MS;
+const MATCH_CONCURRENCY = EXPAND_PERF.MATCH_CONCURRENCY;
+const SAVE_EVERY_N = EXPAND_PERF.SAVE_EVERY_N;
+
+const MASTER_LIST_PATTERNS = [/hoved-liste/i, /_export\.xlsx$/i];
+
+function isScraperOutputFile(filename) {
+  return /^GoogleMapsResults/i.test(filename);
+}
+
+function isExcludedInputFile(filename) {
+  return (
+    filename.includes('_EXPANDED') ||
+    filename.includes('_ALL') ||
+    filename.includes('_NEW_ONLY') ||
+    filename.includes('CHECKPOINT') ||
+    filename.startsWith('PARTIAL_') ||
+    MASTER_LIST_PATTERNS.some((re) => re.test(filename))
+  );
+}
+
+function resolveScrapeInputFile(cliFilename) {
+  if (cliFilename) return cliFilename;
+  const fromProgress = readScrapeOutputFromProgress();
+  if (fromProgress) return fromProgress;
+  return findMostRecentExcelFile();
+}
 
 function findMostRecentExcelFile() {
-  const files = fs
+  const candidates = fs
     .readdirSync('.')
-    .filter((file) => file.endsWith('.xlsx') && !file.startsWith('~$') && !file.includes('_EXPANDED'))
+    .filter(
+      (file) =>
+        file.endsWith('.xlsx') && !file.startsWith('~$') && !isExcludedInputFile(file)
+    )
     .map((file) => ({
       name: file,
       time: fs.statSync(file).mtime.getTime(),
+      isScraper: isScraperOutputFile(file),
     }))
-    .sort((a, b) => b.time - a.time);
+    .sort((a, b) => {
+      if (a.isScraper !== b.isScraper) return a.isScraper ? -1 : 1;
+      return b.time - a.time;
+    });
 
-  return files.length > 0 ? files[0].name : null;
+  return candidates.length > 0 ? candidates[0].name : null;
 }
 
 function ensureColumns(data) {
@@ -82,12 +133,12 @@ function applyMatchToRow(business, match, data, dataIndex) {
 
 async function expandExcelWithContactPersons(excelFilename = null) {
   if (!excelFilename) {
-    excelFilename = findMostRecentExcelFile();
+    excelFilename = resolveScrapeInputFile(null);
     if (!excelFilename) {
       console.error('❌ No Excel file found in current directory');
       process.exit(1);
     }
-    console.log(`📄 Using most recent file: ${excelFilename}`);
+    console.log(`📄 Using scrape file: ${excelFilename}`);
   } else if (!fs.existsSync(excelFilename)) {
     console.error(`❌ File not found: ${excelFilename}`);
     process.exit(1);
@@ -106,9 +157,61 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   }
 
   ensureColumns(data);
-  console.log(`✅ Found ${data.length} businesses to process\n`);
+  console.log(`✅ Found ${data.length} businesses in scrape file\n`);
 
-  const businessesToProcess = TEST_LIMIT ? data.slice(0, TEST_LIMIT) : data;
+  const skipMasterList = EXPAND_PERF.SKIP_MASTER_LIST_DEDUPE;
+  const exclusionPaths = skipMasterList ? [] : discoverExclusionPaths(process.argv[3]);
+  const existingLeads =
+    exclusionPaths.length > 0 ? loadCombinedExistingLeadIndex(exclusionPaths) : null;
+
+  if (skipMasterList) {
+    console.log('ℹ️  Existing-lead dedupe skipped (SKIP_MASTER_LIST=1). All scrape rows will be expanded.\n');
+  }
+
+  let dataToExpand = data;
+  if (existingLeads) {
+    console.log('='.repeat(60));
+    console.log('🚫 EXCLUDING EXISTING LEADS');
+    console.log('='.repeat(60));
+    console.log(`📋 Exclusion sources (${existingLeads.sourceFiles.length} files, ${existingLeads.count} rows read):`);
+    for (const src of existingLeads.sourceFiles) {
+      console.log(`   - ${src}`);
+    }
+
+    const { kept, excluded } = filterNewLeads(data, existingLeads);
+    const byReason = {};
+    for (const { reason } of excluded) {
+      byReason[reason] = (byReason[reason] || 0) + 1;
+    }
+
+    console.log(`   Scrape rows: ${data.length}`);
+    console.log(`   Already in master list: ${excluded.length}`);
+    console.log(`   New leads to expand: ${kept.length}`);
+    if (excluded.length > 0) {
+      console.log('   Match reasons:', Object.entries(byReason).map(([k, v]) => `${k}=${v}`).join(', '));
+    }
+    console.log('='.repeat(60) + '\n');
+
+    if (kept.length === 0) {
+      console.error('❌ No new leads left after excluding your existing list.');
+      process.exit(1);
+    }
+
+    const newOnlyFilename = excelFilename.replace('.xlsx', '_NEW_ONLY.xlsx');
+    const newOnlyWorkbook = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(newOnlyWorkbook, xlsx.utils.json_to_sheet(kept), 'New leads');
+    xlsx.writeFile(newOnlyWorkbook, newOnlyFilename);
+    console.log(`💾 New-leads-only file: ${newOnlyFilename}\n`);
+
+    dataToExpand = kept;
+    excelFilename = newOnlyFilename;
+  } else if (!skipMasterList && exclusionPaths.length > 0 && !existingLeads) {
+    console.log('⚠️  Exclusion files not found — processing all rows\n');
+  } else if (!skipMasterList) {
+    console.log('ℹ️  No master list file — processing all scrape rows\n');
+  }
+
+  const businessesToProcess = TEST_LIMIT ? dataToExpand.slice(0, TEST_LIMIT) : dataToExpand;
   if (TEST_LIMIT) {
     console.log(`🧪 TESTING MODE: Processing only first ${TEST_LIMIT} businesses\n`);
   }
@@ -118,35 +221,28 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   let notFoundCount = 0;
   let shouldStop = false;
   let lastSavedFilename = null;
+  const expandOutputFile = getExpandOutputFile(excelFilename);
+  writeProgress({
+    scrapeOutputFile: excelFilename,
+    expandOutputFile,
+  });
+  console.log(`📁 Expand output (one file, updated during matching): ${expandOutputFile}\n`);
 
   const saveProgress = async (force = false) => {
     try {
-      if (TEST_LIMIT) {
-        businessesToProcess.forEach((processed) => {
-          const originalIdx = data.findIndex(
-            (b) => (b.Name || b.name) === (processed.Name || processed.name)
-          );
-          if (originalIdx !== -1) data[originalIdx] = processed;
-        });
-      }
-
-      const newWorksheet = xlsx.utils.json_to_sheet(data);
+      const newWorksheet = xlsx.utils.json_to_sheet(businessesToProcess);
       const newWorkbook = xlsx.utils.book_new();
-      xlsx.utils.book_append_sheet(newWorkbook, newWorksheet, workbook.SheetNames[0]);
+      xlsx.utils.book_append_sheet(newWorkbook, newWorksheet, 'Results');
 
-      for (let i = 1; i < workbook.SheetNames.length; i++) {
-        const sheet = workbook.Sheets[workbook.SheetNames[i]];
-        xlsx.utils.book_append_sheet(newWorkbook, sheet, workbook.SheetNames[i]);
-      }
-
-      const progressFilename = excelFilename.replace('.xlsx', '_EXPANDED.xlsx');
-      xlsx.writeFile(newWorkbook, progressFilename);
-      lastSavedFilename = progressFilename;
+      xlsx.writeFile(newWorkbook, expandOutputFile);
+      lastSavedFilename = expandOutputFile;
 
       if (updatedCount % 10 === 0 || force) {
-        console.log(`\n💾 Progress saved to: ${progressFilename} (${updatedCount} processed)`);
+        console.log(
+          `\n💾 Expand saved: ${expandOutputFile} (${updatedCount}/${businessesToProcess.length} rows)`
+        );
       }
-      return progressFilename;
+      return expandOutputFile;
     } catch (error) {
       console.error(`\n⚠️  Error saving progress: ${error.message}`);
       return null;
@@ -171,40 +267,83 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   process.on('SIGTERM', () => shutdownHandler('SIGTERM').catch(() => process.exit(1)));
 
   console.log('='.repeat(60));
-  console.log('📌 Brreg matching (API + DeepSeek for Tier 2/3)');
+  console.log(
+    `📌 Brreg matching (${FAST_MODE ? '⚡ fast' : 'standard'} — concurrency ${MATCH_CONCURRENCY})`
+  );
+  console.log(`📊 Live progress: ${PROGRESS_TXT}`);
   console.log('='.repeat(60) + '\n');
 
-  for (const [index, business] of businessesToProcess.entries()) {
-    if (index < START_FROM_INDEX) continue;
-    if (shouldStop) break;
+  const expandStartedAtMs = Date.now();
+  clearProgress('expand');
+  reportExpandProgress(
+    {
+      processed: 0,
+      total: businessesToProcess.length,
+      startedAtMs: expandStartedAtMs,
+      matched: 0,
+      inputFile: excelFilename,
+    },
+    { log: true }
+  );
+
+  const matchLog = EXPAND_PERF.QUIET_LOGS ? () => {} : (msg) => console.log(msg);
+
+  async function processOneBusiness(business, index) {
+    if (index < START_FROM_INDEX || shouldStop) return;
 
     const businessName = business.Name || business.name || 'Unknown';
-    console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 ${businessName}`);
+    if (!EXPAND_PERF.QUIET_LOGS) {
+      console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 ${businessName}`);
+    }
 
     try {
-      const dataIndex = data.findIndex((b) => (b.Name || b.name) === businessName);
-      const match = await matchBusinessToBrreg(business, (msg) => console.log(msg));
+      const match = await matchBusinessToBrreg(business, matchLog);
 
       if (match) {
         foundCount++;
-        console.log(`  📋 Orgnr: ${match.orgnr} | ${match.brregName} | Tier ${match.tier}`);
+        if (!EXPAND_PERF.QUIET_LOGS) {
+          console.log(`  📋 Orgnr: ${match.orgnr} | ${match.brregName} | Tier ${match.tier}`);
+        }
       } else {
         notFoundCount++;
       }
 
-      applyMatchToRow(business, match, data, dataIndex);
+      applyMatchToRow(business, match, null, -1);
       updatedCount++;
-      await saveProgress();
 
-      if (index < businessesToProcess.length - 1 && !shouldStop) {
+      if (API_DELAY_MS > 0) {
         await new Promise((r) => setTimeout(r, API_DELAY_MS));
       }
     } catch (e) {
-      console.error(`  ❌ Error: ${e.message}`);
-      const dataIndex = data.findIndex((b) => (b.Name || b.name) === businessName);
-      applyMatchToRow(business, null, data, dataIndex);
+      console.error(`  ❌ ${businessName}: ${e.message}`);
+      applyMatchToRow(business, null, null, -1);
       updatedCount++;
       notFoundCount++;
+    }
+  }
+
+  const queue = businessesToProcess.map((business, index) => ({ business, index }));
+  for (let i = 0; i < queue.length && !shouldStop; i += MATCH_CONCURRENCY) {
+    const batch = queue.slice(i, i + MATCH_CONCURRENCY);
+    await Promise.all(batch.map(({ business, index }) => processOneBusiness(business, index)));
+
+    if (updatedCount % SAVE_EVERY_N === 0 || i + MATCH_CONCURRENCY >= queue.length) {
+      await saveProgress();
+    }
+
+    const shouldLogExpand =
+      updatedCount % 10 === 0 || i + MATCH_CONCURRENCY >= queue.length;
+    if (shouldLogExpand) {
+      reportExpandProgress(
+        {
+          processed: updatedCount,
+          total: businessesToProcess.length,
+          startedAtMs: expandStartedAtMs,
+          matched: foundCount,
+          inputFile: excelFilename,
+        },
+        { log: true }
+      );
     }
   }
 
@@ -217,10 +356,10 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   console.log('🔍 PHONE FILTER (report only — source file unchanged)');
   console.log('='.repeat(60));
 
-  const beforeFilterCount = data.length;
+  const beforeFilterCount = businessesToProcess.length;
   let filteredOutPhone = 0;
 
-  const withPhone = data.filter((business) => {
+  const withPhone = businessesToProcess.filter((business) => {
     const googlePhone = (business.Phone || '').trim();
     const businessPhone = (business['Business Phone'] || '').trim();
     const hasGooglePhone = googlePhone && googlePhone !== 'Not found' && googlePhone.length >= 8;
@@ -235,7 +374,7 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     return false;
   });
 
-  const matchedCount = data.filter(
+  const matchedCount = businessesToProcess.filter(
     (b) => b.Orgnr && String(b.Orgnr).replace(/\D/g, '').length >= 8
   ).length;
   const matchedWithPhone = withPhone.filter(
@@ -260,9 +399,12 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   console.log(`Match rate: ${((foundCount / updatedCount) * 100).toFixed(1)}%`);
   console.log(`Rows without phone (kept in file): ${filteredOutPhone}`);
   if (lastSavedFilename) {
-    console.log(`📁 Output: ${lastSavedFilename}`);
+    console.log(`✅ Expand complete — final file: ${lastSavedFilename}`);
   }
   console.log('='.repeat(60) + '\n');
+  markDone(
+    `Expand finished · ${updatedCount} rows · ${foundCount} Brreg matches · ${lastSavedFilename || expandOutputFile}`
+  );
 }
 
 const excelFile = process.argv[2];

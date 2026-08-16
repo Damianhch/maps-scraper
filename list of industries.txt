@@ -1,23 +1,4 @@
-cafe
-bar
-bakery
-catering
-food truck
-clinic
-dentist
-physiotherapist
-therapist
-massage
-salon
-barbershop
-tattoo studio
-beauty spa
-gym
-yoga studio
-photographer
-videographer
-graphic designer
-home renovation
-bathroom renovation
+interiør designer
+arkitekt
 kitchen renovation
-roofing
+landscaper

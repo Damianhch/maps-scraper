@@ -8,6 +8,12 @@
   "scripts": {
     "scrape": "node scraper.js",
     "scrape-and-expand": "node scraper.js && node expand.js",
-    "expand": "node expand.js"
+    "scrape-and-expand-new": "node scraper.js && node expand.js",
+    "fast": "node scraper.js && node expand.js",
+    "expand": "node expand.js",
+    "places-estimate": "node places-estimate.js",
+    "progress": "node -e \"const fs=require('fs');const p='run-progress.txt';try{console.log(fs.readFileSync(p,'utf8'))}catch{console.log('No progress yet — run npm run fast first.')}\"",
+    "overnight-chain": "node overnight-chain.js",
+    "merge-expanded": "node merge-expanded.js"
   }
 }
