@@ -11,9 +11,17 @@
     "scrape-and-expand-new": "node scraper.js && node expand.js",
     "fast": "node scraper.js && node expand.js",
     "expand": "node expand.js",
+    "backwards": "node brreg-new-businesses.js",
+    "backwards:test": "node brreg-new-businesses.js --test",
     "places-estimate": "node places-estimate.js",
     "progress": "node -e \"const fs=require('fs');const p='run-progress.txt';try{console.log(fs.readFileSync(p,'utf8'))}catch{console.log('No progress yet — run npm run fast first.')}\"",
     "overnight-chain": "node overnight-chain.js",
-    "merge-expanded": "node merge-expanded.js"
+    "merge-expanded": "node merge-expanded.js",
+    "brreg-new": "node brreg-new-businesses.js",
+    "brreg-new:test": "node brreg-new-businesses.js --test",
+    "brreg-new:schedule": "node brreg-new-schedule.js",
+    "brreg-new:phones": "node brreg-new-backfill-phones.js",
+    "brreg-new:owner-phones": "node brreg-new-backfill-owner-phones.js",
+    "brreg-new:underenheter": "node brreg-new-backfill-underenheter.js"
   }
 }

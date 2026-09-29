@@ -43,6 +43,7 @@ function isExcludedInputFile(filename) {
     filename.includes('_NEW_ONLY') ||
     filename.includes('CHECKPOINT') ||
     filename.startsWith('PARTIAL_') ||
+    /^BrregNewBusinesses/i.test(filename) ||
     MASTER_LIST_PATTERNS.some((re) => re.test(filename))
   );
 }
