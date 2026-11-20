@@ -3,11 +3,15 @@ const xlsx = require('xlsx'); // Import the xlsx library to handle Excel files
 const fs = require('fs'); // Import fs to read the industries file
 const path = require('path'); // Import path for file operations
 const readline = require('readline'); // Import readline for user input
+const { isRealBusinessWebsite, cleanWebsiteUrl } = require('./lib/website-filter');
+const { extractPhoneFromGoogleMapsPage } = require('./lib/google-maps-phone');
+const { MIN_REVIEW_COUNT } = require('./lib/filters');
 
 // ============================================
 // PARALLEL BROWSER CONFIGURATION
 // ============================================
-const NUM_PARALLEL_BROWSERS = 3; // Number of browsers to run in parallel (set to 1 for testing)
+const NUM_PARALLEL_BROWSERS = 5; // Number of browsers to run in parallel (set to 1 for testing)
+// MIN_REVIEW_COUNT comes from lib/filters.js (0+ reviews — website filter still applies)
 
 // ============================================
 // GRACEFUL SHUTDOWN HANDLER
@@ -512,100 +516,6 @@ function formatProxy(proxyString) {
     return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
   }
   return null;
-}
-
-// Function to check if a website is a real business website (not platform/social media)
-function isRealBusinessWebsite(url, businessName) {
-  if (!url || url === 'Not found') {
-    return false; // No website = not a real business website
-  }
-
-  // List of domains that are NOT real business websites (social media, delivery platforms, etc.)
-  const nonBusinessDomains = [
-    'wolt.com',
-    'foodora.no',
-    'just-eat.no',
-    'uber.com',
-    'doordash.com',
-    'grubhub.com',
-    'deliveroo.com',
-    'google.com',
-    'google.no',
-    'googlemaps.com',
-    'maps.google.com',
-    'facebook.com',
-    'instagram.com',
-    'tripadvisor.com',
-    'yelp.com',
-    'foursquare.com',
-    'zomato.com',
-    'opentable.com',
-    'resy.com',
-    'bookatable.com',
-    'thefork.com',
-    'tiktok.com',
-    'youtube.com',
-    'pinterest.com',
-    'snapchat.com',
-    'linkedin.com',
-    'twitter.com',
-    'booking.resdiary.com',
-    'booking.gastroplanner.no',
-    'resdiary.com',
-    'gastroplanner.no'
-  ];
-
-  try {
-    const urlObj = new URL(url);
-    const domain = urlObj.hostname.toLowerCase();
-    
-    // Check if the domain is in the non-business list
-    for (const nonBusinessDomain of nonBusinessDomains) {
-      if (domain.includes(nonBusinessDomain)) {
-        return false; // This is NOT a real business website
-      }
-    }
-    
-    // If it's not a non-business domain and has a proper domain structure, it's likely a real business website
-    if (domain.includes('.') && !domain.includes('google') && !domain.includes('facebook') && !domain.includes('instagram')) {
-      // Check if it's a proper domain (not just a subdomain of a platform)
-      const domainParts = domain.split('.');
-      if (domainParts.length >= 2) {
-        // Handle www. domains by removing www. prefix
-        let mainDomain;
-        if (domainParts[0] === 'www' && domainParts.length >= 3) {
-          mainDomain = domainParts[domainParts.length - 2] + '.' + domainParts[domainParts.length - 1];
-        } else {
-          mainDomain = domainParts[domainParts.length - 2] + '.' + domainParts[domainParts.length - 1];
-        }
-        
-        // If it's not a known platform domain, it's likely a real business website
-        const isKnownPlatform = nonBusinessDomains.some(platform => mainDomain.includes(platform));
-        if (!isKnownPlatform) {
-          return true; // This is a real business website
-        }
-      }
-    }
-    
-    return false; // Default to not a real business website
-  } catch (error) {
-    return false; // If URL parsing fails, not a real business website
-  }
-}
-
-// Function to clean website URL - empty non-business links, keep real business websites
-function cleanWebsiteUrl(url, businessName) {
-  if (!url || url === 'Not found') {
-    return ''; // No website = empty field
-  }
-
-  // If it's a real business website, keep it
-  if (isRealBusinessWebsite(url, businessName)) {
-    return url;
-  }
-  
-  // Otherwise, empty the field (it's a platform/social media link)
-  return '';
 }
 
 // Function to read industries from the text file
@@ -1604,171 +1514,8 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
         console.log('Could not extract website:', error.message);
       }
       
-      // Extract phone number using comprehensive selectors
-      let phone = 'Not found';
-      try {
-        const phoneSelectors = [
-          'button[data-item-id="phone"]',
-          '[data-item-id="phone"]',
-          'button[aria-label*="Phone"]',
-          'button[aria-label*="Telefon"]', // Norwegian for phone
-          'button[aria-label*="Ring"]',
-          '[aria-label*="Phone"]',
-          '[aria-label*="Telefon"]',
-          '[aria-label*="Ring"]',
-          '.Io6YTe[data-value*="Phone"]',
-          '.Io6YTe[data-value*="Telefon"]',
-          '.Io6YTe:contains("Phone")',
-          '.Io6YTe:contains("Telefon")',
-          'span[data-value*="+"]',
-          'span[data-value*="47"]',
-          'a[href^="tel:"]',
-          'button[data-value*="+"]',
-          'button[data-value*="47"]',
-          '[data-value*="+"]',
-          '[data-value*="47"]',
-          '.fontBodyMedium span',
-          '.fontBodyMedium button',
-          'span:contains("+47")',
-          'span:contains("+")',
-          'button:contains("+47")',
-          'button:contains("+")',
-          '[jsaction*="pane"] span',
-          '[jsaction*="pane"] button',
-          '.CsEnBe span',
-          '.CsEnBe button'
-        ];
-        
-        for (const selector of phoneSelectors) {
-          try {
-            const phoneElement = await page.$(selector);
-            if (phoneElement) {
-              phone = await phoneElement.evaluate(el => {
-                const ariaLabel = el.getAttribute('aria-label');
-                const textContent = el.textContent?.trim();
-                const dataValue = el.getAttribute('data-value');
-                const href = el.getAttribute('href');
-                
-                // Enhanced phone number regex patterns
-                const phonePatterns = [
-                  /(\+47\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{2})/,  // Norwegian format: +47 XX XX XX XX
-                  /(\+47\s?\d{8})/,                          // Norwegian format: +47XXXXXXXX
-                  /(\+?\d{1,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4})/, // General international
-                  /(\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4})/,   // Local format
-                  /(\+47\d{8})/                              // Norwegian without spaces
-                ];
-                
-                // Try to extract phone number from aria-label
-                if (ariaLabel) {
-                  for (const pattern of phonePatterns) {
-                    const phoneMatch = ariaLabel.match(pattern);
-                    if (phoneMatch) {
-                      const phoneNumber = phoneMatch[1].replace(/\s+/g, ' ').trim();
-                      if (phoneNumber.length >= 8) return phoneNumber;
-                    }
-                  }
-                  
-                  // Remove common prefixes and try again
-                  const cleanLabel = ariaLabel.replace(/^(Phone|Ring|Telefon|Call):\s*/i, '').trim();
-                  if (cleanLabel && !cleanLabel.includes('telefonnummeret') && !cleanLabel.includes('Ring')) {
-                    for (const pattern of phonePatterns) {
-                      const phoneMatch = cleanLabel.match(pattern);
-                      if (phoneMatch) {
-                        const phoneNumber = phoneMatch[1].replace(/\s+/g, ' ').trim();
-                        if (phoneNumber.length >= 8) return phoneNumber;
-                      }
-                    }
-                    // If no pattern matches but it looks like a phone number
-                    if (/\d{8,}/.test(cleanLabel)) {
-                      return cleanLabel;
-                    }
-                  }
-                }
-                
-                // Try to extract from text content
-                if (textContent) {
-                  for (const pattern of phonePatterns) {
-                    const phoneMatch = textContent.match(pattern);
-                    if (phoneMatch) {
-                      const phoneNumber = phoneMatch[1].replace(/\s+/g, ' ').trim();
-                      if (phoneNumber.length >= 8) return phoneNumber;
-                    }
-                  }
-                  
-                  if (!textContent.includes('telefonnummeret') && !textContent.includes('Ring') && /\d{8,}/.test(textContent)) {
-                    return textContent;
-                  }
-                }
-                
-                // Try data-value
-                if (dataValue) {
-                  for (const pattern of phonePatterns) {
-                    const phoneMatch = dataValue.match(pattern);
-                    if (phoneMatch) {
-                      const phoneNumber = phoneMatch[1].replace(/\s+/g, ' ').trim();
-                      if (phoneNumber.length >= 8) return phoneNumber;
-                    }
-                  }
-                  if (/\d{8,}/.test(dataValue)) {
-                    return dataValue;
-                  }
-                }
-                
-                // Try href (tel: links)
-                if (href && href.startsWith('tel:')) {
-                  const phoneNumber = href.replace('tel:', '').trim();
-                  if (phoneNumber.length >= 8) return phoneNumber;
-                }
-                
-                return null;
-              });
-              if (phone && phone !== 'Not found' && phone !== 'Ring telefonnummeret') break;
-            }
-          } catch (e) {
-            // Continue to next selector
-          }
-        }
-      } catch (error) {
-        console.log('Could not extract phone:', error.message);
-      }
-      
-      // Fallback: Search for phone numbers in the entire page content
-      if (phone === 'Not found') {
-        try {
-          const pageContent = await page.evaluate(() => {
-            const phonePatterns = [
-              /(\+47\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{2})/g,
-              /(\+47\s?\d{8})/g,
-              /(\+?\d{1,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4})/g,
-              /(\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4})/g
-            ];
-            
-            const allText = document.body.innerText;
-            const foundPhones = [];
-            
-            phonePatterns.forEach(pattern => {
-              const matches = allText.match(pattern);
-              if (matches) {
-                matches.forEach(match => {
-                  const cleanPhone = match.replace(/\s+/g, ' ').trim();
-                  if (cleanPhone.length >= 8 && !foundPhones.includes(cleanPhone)) {
-                    foundPhones.push(cleanPhone);
-                  }
-                });
-              }
-            });
-            
-            return foundPhones;
-          });
-          
-          if (pageContent.length > 0) {
-            phone = pageContent[0]; // Take the first valid phone number found
-            console.log(`Found phone via fallback: ${phone}`);
-          }
-        } catch (error) {
-          console.log('Fallback phone search failed:', error.message);
-        }
-      }
+      // Phone: Google Maps place panel (button.CsEnBe + data-item-id phone:tel: + .Io6YTe)
+      const phone = await extractPhoneFromGoogleMapsPage(page);
 
       // Extract additional business details
       let rating = 'Not found';
@@ -1956,10 +1703,9 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
       console.log(`Hours: ${hours}`);
       console.log(`Price Level: ${priceLevel}`);
 
-      // QUALITY FILTER 1: Check review count (over 7 = 8+ reviews required)
-      const MIN_REVIEW_COUNT = 8; // Over 7 = 8+ reviews required
+      // QUALITY FILTER 1: Review count (phone filtering happens after expand, not here)
       if (reviewCount < MIN_REVIEW_COUNT) {
-        console.log(`❌ SKIPPING ${businessName} - Only ${reviewCount} reviews (need over 7, i.e. ${MIN_REVIEW_COUNT}+)`);
+        console.log(`❌ SKIPPING ${businessName} - Only ${reviewCount} reviews (need ${MIN_REVIEW_COUNT}+)`);
         console.log('---------------------------');
         continue; // Skip this business - not enough reviews
       }
@@ -2135,9 +1881,9 @@ async function scrapeGoogleMaps(industry, industryIndex = 0, proxies = [], brows
   if (TEST_LIMIT) {
     console.log(`🧪 TESTING MODE: Processed ${businessesToProcess.length} of ${results.length} businesses`);
   }
-  console.log(`Businesses KEPT (8+ reviews, no website): ${excelData.length}`);
+  console.log(`Businesses KEPT (${MIN_REVIEW_COUNT}+ reviews, no website): ${excelData.length}`);
   console.log(`Businesses FILTERED OUT: ${businessesToProcess.length - excelData.length}`);
-  console.log(`  - Reasons: ≤7 reviews, has real website`);
+  console.log(`  - Reasons: <${MIN_REVIEW_COUNT} reviews, has real website`);
   console.log(`Time taken: ${industryDuration} seconds`);
   console.log('========================\n');
 

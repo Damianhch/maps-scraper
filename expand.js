@@ -3,6 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const { matchBusinessToBrreg } = require('./lib/match');
 const { loadEnv } = require('./lib/ai-match');
+const { hasValidPhone, filterRowsWithValidPhone } = require('./lib/phone-filter');
+const { passesOrgFormFilter, hasBrregWebsite } = require('./lib/filters');
+const { flushRegnskapCache } = require('./lib/brreg-regnskap');
 
 loadEnv();
 
@@ -35,6 +38,15 @@ function ensureColumns(data) {
     'Brreg Parent Orgnr': '',
     'Match Score': '',
     'Match Confidence': '',
+    'Accounting Orgnr': '',
+    'Revenue NOK': '',
+    'Revenue Year': '',
+    'Operating Profit': '',
+    'Net Profit': '',
+    Equity: '',
+    'Accounting Status': '',
+    'Brreg Website': '',
+    'Has Brreg Website': '',
   };
 
   for (const row of data) {
@@ -62,6 +74,15 @@ function applyMatchToRow(business, match, data, dataIndex) {
     business['Brreg Parent Orgnr'] = match.parentOrgnr || '';
     business['Match Score'] = match.matchScore;
     business['Match Confidence'] = match.matchConfidence;
+    business['Accounting Orgnr'] = match.accountingOrgnr || '';
+    business['Revenue NOK'] = match.revenueNok ?? '';
+    business['Revenue Year'] = match.revenueYear || '';
+    business['Operating Profit'] = match.operatingProfit ?? '';
+    business['Net Profit'] = match.netProfit ?? '';
+    business.Equity = match.equity ?? '';
+    business['Accounting Status'] = match.accountingStatus || '';
+    business['Brreg Website'] = match.brregWebsite || '';
+    business['Has Brreg Website'] = hasBrregWebsite(match.brregWebsite);
   } else {
     business['Contact Person'] = 'Not found';
     business['Business Phone'] = 'Not found';
@@ -73,6 +94,15 @@ function applyMatchToRow(business, match, data, dataIndex) {
     business['Brreg Parent Orgnr'] = '';
     business['Match Score'] = '';
     business['Match Confidence'] = '';
+    business['Accounting Orgnr'] = '';
+    business['Revenue NOK'] = '';
+    business['Revenue Year'] = '';
+    business['Operating Profit'] = '';
+    business['Net Profit'] = '';
+    business.Equity = '';
+    business['Accounting Status'] = '';
+    business['Brreg Website'] = '';
+    business['Has Brreg Website'] = '';
   }
 
   if (dataIndex !== -1) {
@@ -119,7 +149,8 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   let shouldStop = false;
   let lastSavedFilename = null;
 
-  const saveProgress = async (force = false) => {
+  const saveProgress = async (force = false, options = {}) => {
+    const { applyPhoneFilter = false } = options;
     try {
       if (TEST_LIMIT) {
         businessesToProcess.forEach((processed) => {
@@ -130,7 +161,11 @@ async function expandExcelWithContactPersons(excelFilename = null) {
         });
       }
 
-      const newWorksheet = xlsx.utils.json_to_sheet(data);
+      let rowsToWrite = data;
+      if (applyPhoneFilter) {
+        rowsToWrite = filterRowsWithValidPhone([...data]).filter(passesOrgFormFilter);
+      }
+      const newWorksheet = xlsx.utils.json_to_sheet(rowsToWrite);
       const newWorkbook = xlsx.utils.book_new();
       xlsx.utils.book_append_sheet(newWorkbook, newWorksheet, workbook.SheetNames[0]);
 
@@ -144,7 +179,8 @@ async function expandExcelWithContactPersons(excelFilename = null) {
       lastSavedFilename = progressFilename;
 
       if (updatedCount % 10 === 0 || force) {
-        console.log(`\n💾 Progress saved to: ${progressFilename} (${updatedCount} processed)`);
+        const suffix = applyPhoneFilter ? ', phone filter applied' : ', all rows (pre phone filter)';
+        console.log(`\n💾 Progress saved to: ${progressFilename} (${updatedCount} processed${suffix})`);
       }
       return progressFilename;
     } catch (error) {
@@ -187,7 +223,9 @@ async function expandExcelWithContactPersons(excelFilename = null) {
 
       if (match) {
         foundCount++;
-        console.log(`  📋 Orgnr: ${match.orgnr} | ${match.brregName} | Tier ${match.tier}`);
+        const rev =
+          match.revenueNok != null ? `${Math.round(match.revenueNok / 1e6)}M (${match.revenueYear})` : match.accountingStatus;
+        console.log(`  📋 Orgnr: ${match.orgnr} | ${match.brregName} | Tier ${match.tier} | omsetning ${rev}`);
       } else {
         notFoundCount++;
       }
@@ -208,47 +246,41 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     }
   }
 
-  if (!shouldStop) {
-    console.log('\n💾 Saving final progress...');
-    await saveProgress(true);
-  }
-
-  console.log('\n' + '='.repeat(60));
-  console.log('🔍 PHONE FILTER (report only — source file unchanged)');
-  console.log('='.repeat(60));
-
   const beforeFilterCount = data.length;
   let filteredOutPhone = 0;
+  let withPhoneCount = 0;
 
-  const withPhone = data.filter((business) => {
-    const googlePhone = (business.Phone || '').trim();
-    const businessPhone = (business['Business Phone'] || '').trim();
-    const hasGooglePhone = googlePhone && googlePhone !== 'Not found' && googlePhone.length >= 8;
-    const hasBusinessPhone = businessPhone && businessPhone !== 'Not found' && businessPhone.length >= 8;
-
-    if (hasGooglePhone || hasBusinessPhone) {
-      business['Has Valid Phone'] = true;
-      return true;
-    }
-    business['Has Valid Phone'] = false;
-    filteredOutPhone++;
-    return false;
-  });
+  if (!shouldStop) {
+    console.log('\n📞 Applying phone filter (Google Phone or Business Phone, 8+ digits)...');
+    withPhoneCount = data.filter((b) => hasValidPhone(b)).length;
+    filteredOutPhone = beforeFilterCount - withPhoneCount;
+    const enkCount = data.filter((b) => !passesOrgFormFilter(b)).length;
+    console.log(`   Before: ${beforeFilterCount} | With phone: ${withPhoneCount} | No phone: ${filteredOutPhone} | ENK removed: ${enkCount}`);
+    console.log('\n💾 Saving final _EXPANDED (phone + ENK filters applied)...');
+    await saveProgress(true, { applyPhoneFilter: true });
+  } else {
+    console.log('\n💾 Interrupted — saving progress without phone filter (re-run expand to finish + filter)');
+    await saveProgress(true);
+    withPhoneCount = data.filter((b) => hasValidPhone(b)).length;
+    filteredOutPhone = beforeFilterCount - withPhoneCount;
+  }
 
   const matchedCount = data.filter(
     (b) => b.Orgnr && String(b.Orgnr).replace(/\D/g, '').length >= 8
   ).length;
-  const matchedWithPhone = withPhone.filter(
-    (b) => b.Orgnr && String(b.Orgnr).replace(/\D/g, '').length >= 8
+  const matchedWithPhone = data.filter(
+    (b) =>
+      hasValidPhone(b) && b.Orgnr && String(b.Orgnr).replace(/\D/g, '').length >= 8
   ).length;
 
-  console.log('\n' + '-'.repeat(60));
-  console.log(`📊 All rows kept in _EXPANDED: ${beforeFilterCount}`);
-  console.log(`📊 With valid phone: ${withPhone.length} (would remove ${filteredOutPhone})`);
-  console.log(`📊 Matched (all): ${matchedCount} (${((matchedCount / beforeFilterCount) * 100).toFixed(1)}%)`);
-  console.log(
-    `📊 Matched + phone: ${matchedWithPhone} (${((matchedWithPhone / beforeFilterCount) * 100).toFixed(1)}%)`
-  );
+  console.log('\n' + '='.repeat(60));
+  console.log('📞 PHONE FILTER');
+  console.log('='.repeat(60));
+  console.log(`📊 Expanded (before phone filter): ${beforeFilterCount}`);
+  console.log(`📊 With valid phone: ${withPhoneCount}`);
+  console.log(`📊 Removed (no phone): ${filteredOutPhone}`);
+  console.log(`📊 Matched (Brreg, all expanded): ${matchedCount}`);
+  console.log(`📊 Matched + valid phone: ${matchedWithPhone}`);
   console.log('='.repeat(60) + '\n');
 
   console.log('\n' + '='.repeat(60));
@@ -258,21 +290,28 @@ async function expandExcelWithContactPersons(excelFilename = null) {
   console.log(`Matched (Brreg): ${foundCount}`);
   console.log(`Not matched: ${notFoundCount}`);
   console.log(`Match rate: ${((foundCount / updatedCount) * 100).toFixed(1)}%`);
-  console.log(`Rows without phone (kept in file): ${filteredOutPhone}`);
+  console.log(
+    `Rows in final file: ${shouldStop ? beforeFilterCount : withPhoneCount} (${shouldStop ? 'no phone filter — interrupted' : 'phone filter applied'})`
+  );
   if (lastSavedFilename) {
     console.log(`📁 Output: ${lastSavedFilename}`);
   }
   console.log('='.repeat(60) + '\n');
+  flushRegnskapCache();
 }
 
-const excelFile = process.argv[2];
+module.exports = { expandExcelWithContactPersons, hasValidPhone, filterRowsWithValidPhone };
 
-console.log('🚀 Starting Brreg-based Excel expansion...\n');
-expandExcelWithContactPersons(excelFile)
-  .then(() => {
-    console.log('✅ Expansion completed successfully!');
-  })
-  .catch((error) => {
-    console.error('❌ Expansion failed:', error);
-    process.exit(1);
-  });
+if (require.main === module) {
+  const excelFile = process.argv[2];
+
+  console.log('🚀 Starting Brreg-based Excel expansion...\n');
+  expandExcelWithContactPersons(excelFile)
+    .then(() => {
+      console.log('✅ Expansion completed successfully!');
+    })
+    .catch((error) => {
+      console.error('❌ Expansion failed:', error);
+      process.exit(1);
+    });
+}

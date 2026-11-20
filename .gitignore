@@ -28,3 +28,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Local Brreg accounting cache
+cache/

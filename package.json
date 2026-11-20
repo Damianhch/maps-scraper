@@ -8,6 +8,10 @@
   "scripts": {
     "scrape": "node scraper.js",
     "scrape-and-expand": "node scraper.js && node expand.js",
-    "expand": "node expand.js"
+    "expand": "node expand.js",
+    "recover-reviews": "node recover_review_skipped.js",
+    "brreg-leads": "node brreg-leads.js",
+    "enrich-revenue": "node enrich-revenue.js",
+    "maps-backfill": "node maps-backfill.js"
   }
 }
