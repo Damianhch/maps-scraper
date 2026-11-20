@@ -1,3 +1,19 @@
+entreprenør
+byggmester
+tømrer
+elektriker
+rørlegger
+maler
+snekker
+murer
+anlegg
+roofing
+home renovation
+bathroom renovation
+kitchen renovation
+landscaper
+interiør designer
+arkitekt
 cafe
 bar
 bakery
@@ -17,16 +33,3 @@ yoga studio
 photographer
 videographer
 graphic designer
-home renovation
-bathroom renovation
-kitchen renovation
-roofing
-entreprenør
-byggmester
-tømrer
-elektriker
-rørlegger
-maler
-snekker
-murer
-anlegg
