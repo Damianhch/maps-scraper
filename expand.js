@@ -702,118 +702,122 @@ async function step1ProffDirectSearch(businessName, address, page) {
   return null;
 }
 
-/** Wait for Bing bot challenge to be solved by the user, if one appears.
- *  Bing shows "Et siste trinn" / "Verifying..." CAPTCHA for automated browsers.
- *  Pauses and waits up to 3 minutes for the user to solve it manually. */
-async function waitForBingChallenge(page) {
-  const isChallenge = await page.evaluate(() => {
-    const body = (document.body ? document.body.innerText : '').toLowerCase();
-    return body.includes('et siste trinn') || body.includes('one more step') ||
-           body.includes('verifying') || body.includes('captcha') ||
-           body.includes('løs utfordringen') || body.includes('solve the challenge');
-  }).catch(() => false);
-
-  if (!isChallenge) return; // No challenge, continue normally
-
-  console.log('\n  ⚠️  ⚠️  ⚠️  BING CHALLENGE DETECTED — PLEASE SOLVE THE PUZZLE IN THE BROWSER WINDOW  ⚠️  ⚠️  ⚠️');
-  console.log('  ⏳ Waiting up to 3 minutes for you to complete the verification...\n');
-
-  const maxWaitMs = 3 * 60 * 1000;
-  const pollMs = 2000;
-  const start = Date.now();
-
-  while (Date.now() - start < maxWaitMs) {
-    await new Promise(r => setTimeout(r, pollMs));
-    const stillChallenge = await page.evaluate(() => {
-      const body = (document.body ? document.body.innerText : '').toLowerCase();
-      return body.includes('et siste trinn') || body.includes('one more step') ||
-             body.includes('verifying') || body.includes('løs utfordringen') ||
-             body.includes('solve the challenge');
-    }).catch(() => false);
-    if (!stillChallenge) {
-      console.log('  ✅ Challenge solved! Continuing...\n');
-      await new Promise(r => setTimeout(r, 1500)); // Let results render
-      return;
-    }
-  }
-  console.log('  ❌ Challenge not solved within 3 minutes — skipping this business.\n');
-}
-
-/** Step 2: DuckDuckGo HTML search for proff.no company profile.
- *  Uses html.duckduckgo.com/html/ — plain HTML, no JS, no redirects, no bot detection, Norwegian results. */
-async function step2BingSearch(businessName, address, page) {
+/** Step 2: Google search for Proff.no fallback. Uses "proff.no" in query (not site:). Tier 2 = name "address" proff.no; Tier 3 = name proff.no. */
+async function step2GoogleSearch(businessName, address, page) {
   if (!address || !String(address).trim()) return null;
   if (!page) return null;
   const normalizedSearchAddress = normalizeAddress(address);
 
-  const doSearch = async (query) => {
-    // DDG HTML endpoint: plain HTML page, direct links, Norwegian region (kl=no-no)
-    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=no-no`;
-    console.log(`  🔍 DDG: ${query.substring(0, 80)}...`);
+  const STEP2_NAV_TIMEOUT = 22000;
+  const runGoogleSearch = async (query) => {
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=no`;
+    let navOk = false;
     try {
-      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    } catch (e) { /* page loads even on timeout */ }
-    await new Promise(r => setTimeout(r, 800));
-
-    const currentUrl = page.url();
-    if (!currentUrl.includes('duckduckgo.com')) {
-      console.log(`  ⚠️  Unexpected URL: ${currentUrl.substring(0, 60)}`);
-      return [];
-    }
-
-    // DDG HTML returns direct links (no redirect wrapping like Bing/Google)
-    const found = await page.evaluate((max) => {
-      const out = [], seen = new Set();
-      // Results are in <div class="result"> or <div class="web-result">
-      const items = Array.from(document.querySelectorAll('.result, .web-result, [data-testid="result"]'));
-      for (const item of items) {
-        // Main link: .result__a or .result__title a
-        const a = item.querySelector('a.result__a, .result__title a, h2 a, a[href*="proff.no"]');
-        if (!a) continue;
-        let href = a.href || a.getAttribute('href') || '';
-        if (!href.startsWith('http')) continue;
-        if (!href.includes('proff.no')) continue;
-        if (href.includes('/sok') || href.includes('/s%C3%B8k') || href.includes('/bransje')) continue;
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: STEP2_NAV_TIMEOUT });
+      navOk = true;
+    } catch (navErr) {
+      const url = page.url();
+      if (url.includes('consent.google') || url.includes('accounts.google')) {
         try {
-          const parts = new URL(href).pathname.split('/').filter(Boolean);
-          if (parts.length < 2) continue;
-          if (!parts.some(p => ['selskap', 'bedrift', 'firma'].includes(p.toLowerCase()))) continue;
+          await page.evaluate(() => {
+            const targets = ['Godta alle', 'Accept all', 'Jeg godtar', 'I agree'];
+            const buttons = [...document.querySelectorAll('button')];
+            for (const target of targets) {
+              for (const btn of buttons) {
+                if ((btn.textContent || '').trim() === target) { btn.click(); return; }
+              }
+            }
+            const byId = document.querySelector('#L2AGLb') || document.querySelector('#W0wltc');
+            if (byId) byId.click();
+          });
+          await new Promise(resolve => setTimeout(resolve, 4000));
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          navOk = true;
+        } catch (e) {}
+      } else if (url.includes('google.com/search')) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        navOk = true;
+      }
+      if (!navOk) {
+        try {
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          navOk = true;
+        } catch (retryErr) {}
+      }
+      if (!navOk) throw navErr;
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const landedUrl = page.url();
+    if (landedUrl.includes('consent.google') || landedUrl.includes('accounts.google')) {
+      try {
+        await page.evaluate(() => {
+          const targets = ['Godta alle', 'Accept all', 'Jeg godtar', 'I agree'];
+          const buttons = [...document.querySelectorAll('button')];
+          for (const target of targets) {
+            for (const btn of buttons) {
+              if ((btn.textContent || '').trim() === target) { btn.click(); return; }
+            }
+          }
+          const byId = document.querySelector('#L2AGLb') || document.querySelector('#W0wltc');
+          if (byId) byId.click();
+        });
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        if (page.url().includes('consent.google') || page.url().includes('accounts.google')) {
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      } catch (e) {}
+    }
+    return page.evaluate((maxResults) => {
+      const out = [];
+      const links = document.querySelectorAll('a[href*="proff.no"]');
+      const seen = new Set();
+      for (const a of links) {
+        const href = a.href || a.getAttribute('href');
+        if (!href || href.includes('google.com') || href.includes('webcache') || href.includes('translate')) continue;
+        if (href.includes('proff.no/sok') || href.includes('proff.no/s%C3%B8k') || href.includes('proff.no/bransje') || href.includes('proff.no/søk')) continue;
+        try {
+          const u = new URL(href);
+          const pathParts = u.pathname.split('/').filter(Boolean);
+          if (pathParts.length < 2) continue;
         } catch (e) { continue; }
-        if (seen.has(href)) continue; seen.add(href);
+        if (seen.has(href)) continue;
+        seen.add(href);
         const title = (a.textContent || '').trim();
-        const blockText = (item.innerText || item.textContent || '').trim();
-        if (title) { out.push({ href, title, blockText }); if (out.length >= max) break; }
+        let blockText = '';
+        const parent = a.closest('div.g') || a.closest('div[data-hveid]') || a.closest('div');
+        if (parent) blockText = (parent.innerText || parent.textContent || '').trim();
+        else blockText = title;
+        out.push({ href, title, blockText });
+        if (out.length >= maxResults) break;
       }
       return out;
-    }, STEP2_MAX_SERP_RESULTS).catch(() => []);
-
-    console.log(`  📊 ${found.length} proff.no company pages found`);
-    return found;
+    }, STEP2_MAX_SERP_RESULTS);
   };
 
   try {
-    // Tier 2: name + quoted address + site:proff.no → accept only if address in snippet
-    const q2 = `${cleanBusinessNameForSearch(businessName) || businessName} "${address}" site:proff.no`;
-    console.log(`  🔎 Tier 2: ${q2}`);
-    const r2 = await doSearch(q2);
+    // Tier 2: name "address" proff.no (no site:) — only accept if address in snippet
+    const q2 = `${cleanBusinessNameForSearch(businessName) || businessName} "${address}" proff.no`;
+    console.log(`  🔎 Tier 2 (Google): ${q2}`);
+    const r2 = await runGoogleSearch(q2);
     const r2addr = r2.filter(r =>
       !isCategoryResult(r.title) && normalizedSearchAddress && addressesMatch(address, r.blockText)
     );
     if (r2addr.length > 0) {
       r2addr.sort((a, b) => nameSimilarityScore(businessName, b.title) - nameSimilarityScore(businessName, a.title));
-      console.log(`  📍 Tier 2 match: "${r2addr[0].title.slice(0, 60)}"`);
+      console.log(`  📍 Tier 2 match: "${(r2addr[0].title || '').slice(0, 60)}"`);
       const d = await openProffUrlAndExtract(r2addr[0].href, page);
       if (d) return { ...d, tier: 2 };
     }
     console.log(`  📋 Tier 2: ${r2.length} results, ${r2addr.length} with matching address`);
 
-    // Tier 3: name only + site:proff.no → first viable result
-    const q3 = `${cleanBusinessNameForSearch(businessName) || businessName} site:proff.no`;
-    console.log(`  🔎 Tier 3: ${q3}`);
-    const r3 = await doSearch(q3);
+    // Tier 3: name proff.no (no site:) — first viable result
+    const q3 = `${cleanBusinessNameForSearch(businessName) || businessName} proff.no`;
+    console.log(`  🔎 Tier 3 (Google): ${q3}`);
+    const r3 = await runGoogleSearch(q3);
     const r3v = r3.filter(r => !isCategoryResult(r.title));
     if (r3v.length > 0) {
-      console.log(`  📌 Tier 3: "${r3v[0].title.slice(0, 60)}"`);
+      console.log(`  📌 Tier 3: "${(r3v[0].title || '').slice(0, 60)}"`);
       const d = await openProffUrlAndExtract(r3v[0].href, page);
       if (d) return { ...d, tier: 3 };
     } else {
@@ -904,9 +908,9 @@ async function scrapeProffContactPerson(businessName, address, page) {
       }
     }
 
-    // Step 2: Google search "address site:proff.no" only; parse SERP, pick result with address in snippet + name in title
+    // Step 2: Google search (name "address" proff.no / name proff.no); parse SERP, pick result with address in snippet or first viable
     if (excelAddress) {
-      const result2 = await step2BingSearch(businessName, excelAddress, page);
+      const result2 = await step2GoogleSearch(businessName, excelAddress, page);
       if (result2) {
         console.log(`  ✅ Matched via Step 2 (Google SERP) → Tier ${result2.tier}`);
         return formatProffResult(result2);
@@ -1344,7 +1348,7 @@ async function expandExcelWithContactPersons(excelFilename = null) {
     if (!excelAddress) continue;
     console.log(`\n[${index + 1}/${businessesToProcess.length}] 🔍 Phase 2 (Google): ${businessName}`);
     try {
-      const result2 = await step2BingSearch(businessName, excelAddress, page);
+      const result2 = await step2GoogleSearch(businessName, excelAddress, page);
       if (result2) {
         const result = formatProffResult(result2);
         business['Contact Person'] = result.contactPerson;
