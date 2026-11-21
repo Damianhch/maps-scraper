@@ -26,6 +26,11 @@
     "brreg-new:schedule": "node brreg-new-schedule.js",
     "brreg-new:phones": "node brreg-new-backfill-phones.js",
     "brreg-new:owner-phones": "node brreg-new-backfill-owner-phones.js",
-    "brreg-new:underenheter": "node brreg-new-backfill-underenheter.js"
+    "brreg-new:underenheter": "node brreg-new-backfill-underenheter.js",
+    "enrich-contacts": "node enrich-contacts.js",
+    "enrich-contacts:roles": "node enrich-contacts.js --roles-only",
+    "enrich-contacts:probe": "node enrich-contacts.js --probe --limit=25",
+    "enrich-contacts:directory": "node enrich-contacts.js --directory --skip-gulesider",
+    "enrich-contacts:gulesider": "node enrich-contacts.js --gulesider-only"
   }
 }

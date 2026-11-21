@@ -1,0 +1,51 @@
+{
+  "rollegrupper": [
+    {
+      "type": { "kode": "DAGL", "beskrivelse": "Daglig leder" },
+      "roller": [
+        {
+          "avregistrert": false,
+          "person": {
+            "erDoed": false,
+            "fodselsdato": "1980-09-02",
+            "navn": { "etternavn": "Hegerland", "fornavn": "Kenneth" }
+          },
+          "type": { "kode": "DAGL", "beskrivelse": "Daglig leder" }
+        }
+      ]
+    },
+    {
+      "type": { "kode": "STYR", "beskrivelse": "Styre" },
+      "roller": [
+        {
+          "avregistrert": false,
+          "person": {
+            "erDoed": false,
+            "fodselsdato": "1965-01-01",
+            "navn": { "etternavn": "Vinje", "fornavn": "Jan Anders" }
+          },
+          "type": { "kode": "LEDE", "beskrivelse": "Styrets leder" }
+        },
+        {
+          "avregistrert": false,
+          "person": {
+            "erDoed": false,
+            "fodselsdato": "1968-07-10",
+            "navn": { "etternavn": "Hovda", "fornavn": "Lars" }
+          },
+          "type": { "kode": "MEDL", "beskrivelse": "Styremedlem" }
+        }
+      ]
+    },
+    {
+      "type": { "kode": "REVI", "beskrivelse": "Revisor" },
+      "roller": [
+        {
+          "avregistrert": false,
+          "enhet": { "navn": ["CEDRA NORGE AS"], "organisasjonsnummer": "935416779" },
+          "type": { "kode": "REVI", "beskrivelse": "Revisor" }
+        }
+      ]
+    }
+  ]
+}
